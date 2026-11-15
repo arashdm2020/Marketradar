@@ -9,6 +9,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -51,6 +52,22 @@ func save(name string, v any) error {
 		return e
 	}
 	return os.WriteFile(filepath.Join("data", name), b, 0600)
+}
+
+func publicAdminURL() (string, error) {
+	raw := strings.TrimSpace(os.Getenv("ADMIN_PUBLIC_URL"))
+	if raw == "" {
+		raw = "http://127.0.0.1:3000/login"
+	}
+	u, e := url.Parse(raw)
+	if e != nil || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return "", fmt.Errorf("ADMIN_PUBLIC_URL must be an absolute URL without credentials, query, or fragment")
+	}
+	loopback := u.Hostname() == "127.0.0.1" || u.Hostname() == "localhost" || u.Hostname() == "::1"
+	if u.Scheme != "https" && !(loopback && u.Scheme == "http") {
+		return "", fmt.Errorf("ADMIN_PUBLIC_URL must use HTTPS outside local development")
+	}
+	return strings.TrimRight(raw, "/"), nil
 }
 func main() {
 	if e := run(); e != nil {
@@ -267,15 +284,20 @@ func run() error {
 		var sweepWorker *treasury.Worker
 		if billing.Chain != nil && os.Getenv("TREASURY_MAINNET_ENABLED") == "true" && os.Getenv("TREASURY_SWEEP_ENABLED") == "true" {
 			sweepWorker = &treasury.Worker{
-				Store:           treasuryStore,
-				Chain:           billing.Chain,
-				Signer:          signer,
-				ExpectedChainID: 56,
+				Store:             treasuryStore,
+				Chain:             billing.Chain,
+				Signer:            signer,
+				ExpectedChainID:   56,
+				DiscoveryInterval: 30 * time.Second,
 			}
 			go sweepWorker.Run(botCtx, 2*time.Second)
 		}
+		adminURL, e := publicAdminURL()
+		if e != nil {
+			return e
+		}
 		worker := telegram.NewAsyncWorker(nil, store, eng)
-		b := telegram.Bot{Token: os.Getenv("TELEGRAM_BOT_TOKEN"), Store: store, PlanPrice: func() (*big.Int, error) { return webStore.Price() }, Deriver: billing.Deriver, Custody: cust, Chain: billing.Chain, Allowed: allowed, Engine: eng, Worker: worker}
+		b := telegram.Bot{Token: os.Getenv("TELEGRAM_BOT_TOKEN"), PublicAdminURL: adminURL, Store: store, PlanPrice: func() (*big.Int, error) { return webStore.Price() }, Deriver: billing.Deriver, Custody: cust, Chain: billing.Chain, Allowed: allowed, Engine: eng, Worker: worker}
 		worker.SetBot(&b)
 		addr := os.Getenv("ADMIN_LISTEN_ADDR")
 		if addr == "" {

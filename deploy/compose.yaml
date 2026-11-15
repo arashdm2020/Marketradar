@@ -16,9 +16,6 @@ services:
     environment:
       SQLITE_PATH: /app/data/tradebot.db
       ADMIN_LISTEN_ADDR: 127.0.0.1:8088
-      TREASURY_MAINNET_ENABLED: "false"
-      TREASURY_TESTNET_ENABLED: "false"
-      TREASURY_SWEEP_ENABLED: "false"
     volumes:
       - marketradar-data:/app/data
     read_only: true

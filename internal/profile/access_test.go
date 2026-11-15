@@ -37,6 +37,63 @@ func TestDailyQuotaAndExemption(t *testing.T) {
 	}
 }
 
+func TestAdminAlwaysBypassesDailyQuota(t *testing.T) {
+	s, e := Open(t.TempDir() + "/admin.db")
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer s.DB.Close()
+	if _, e = s.Ensure(AdminID); e != nil {
+		t.Fatal(e)
+	}
+	now := time.Date(2026, 11, 15, 8, 0, 0, 0, time.UTC)
+	for _, id := range []string{"admin-first", "admin-second", "admin-third"} {
+		if e = s.Reserve(id, AdminID, now); e != nil {
+			t.Fatalf("admin reservation %q was limited: %v", id, e)
+		}
+		if e = s.SetUse(id, "consumed"); e != nil {
+			t.Fatal(e)
+		}
+	}
+	users, e := s.AdminUsers(AdminID)
+	if e != nil || len(users) != 1 || !users[0].Exempt {
+		t.Fatalf("admin exemption not reported: %+v, %v", users, e)
+	}
+	if e = s.SetExempt(AdminID, AdminID, false); e == nil {
+		t.Fatal("permanent admin exemption was revoked")
+	}
+}
+
+func TestExemptionPersistsAndUnknownUserIsRejected(t *testing.T) {
+	path := t.TempDir() + "/persist.db"
+	s, e := Open(path)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if _, e = s.Ensure(42); e != nil {
+		t.Fatal(e)
+	}
+	if e = s.SetExempt(AdminID, 42, true); e != nil {
+		t.Fatal(e)
+	}
+	if e = s.SetExempt(AdminID, 404, true); e == nil {
+		t.Fatal("unknown user accepted")
+	}
+	_ = s.DB.Close()
+	s, e = Open(path)
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer s.DB.Close()
+	users, e := s.AdminUsers(AdminID)
+	if e != nil || len(users) != 1 || !users[0].Exempt {
+		t.Fatalf("persisted exemption missing: %+v, %v", users, e)
+	}
+	if e = s.Reserve("exempt-after-restart", 42, time.Now()); e != nil {
+		t.Fatalf("persisted exemption did not grant access: %v", e)
+	}
+}
+
 func TestConcurrentReserve(t *testing.T) {
 	s, e := Open(t.TempDir() + "/test.db")
 	if e != nil {

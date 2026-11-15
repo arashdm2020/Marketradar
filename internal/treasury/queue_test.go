@@ -165,3 +165,38 @@ func TestDestinationReviewQueueRecoveryAndNoDoubleSweep(t *testing.T) {
 		t.Fatalf("fee deduction %s", signer.last.AmountWei)
 	}
 }
+
+func TestBalanceDiscoveryQueuesEachWalletOnce(t *testing.T) {
+	p, e := profile.Open(t.TempDir() + "/discovery.db")
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer p.DB.Close()
+	if _, e = webapp.NewStore(p.DB); e != nil {
+		t.Fatal(e)
+	}
+	if _, e = p.Ensure(profile.AdminID); e != nil {
+		t.Fatal(e)
+	}
+	if _, e = p.EnsureCustodialWallet(profile.AdminID); e != nil {
+		t.Fatal(e)
+	}
+	store := &Store{DB: p.DB, Profiles: p}
+	if e = store.SeedDestination(DefaultDestination); e != nil {
+		t.Fatal(e)
+	}
+	chain := &fakeChain{chain: 56}
+	worker := &Worker{Store: store, Chain: chain, Signer: &fakeSigner{}, ExpectedChainID: 56}
+	queued, e := worker.DiscoverBalances(context.Background())
+	if e != nil || queued != 1 {
+		t.Fatalf("first discovery queued=%d err=%v", queued, e)
+	}
+	queued, e = worker.DiscoverBalances(context.Background())
+	if e != nil || queued != 0 {
+		t.Fatalf("duplicate discovery queued=%d err=%v", queued, e)
+	}
+	var count int
+	if e = p.DB.QueryRow(`SELECT count(*) FROM treasury_jobs WHERE status='queued'`).Scan(&count); e != nil || count != 1 {
+		t.Fatalf("queued jobs=%d err=%v", count, e)
+	}
+}

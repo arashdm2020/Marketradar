@@ -88,13 +88,27 @@ func TestAdminAuthenticationAndLookup(t *testing.T) {
 	if !strings.Contains(w.Body.String(), "track-22") {
 		t.Fatal("tracking number absent")
 	}
+	form := url.Values{"user_id": {"22"}, "exempt": {"true"}}
+	req = httptest.NewRequest("POST", "/api/exemption", strings.NewReader(form.Encode()))
+	req.Header.Set("Origin", "http://example.com")
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.AddCookie(cookie)
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("exemption update: %d %s", w.Code, w.Body.String())
+	}
+	users, e := store.AdminUsers(profile.AdminID)
+	if e != nil || len(users) != 1 || !users[0].Exempt {
+		t.Fatalf("exemption was not persisted: %+v %v", users, e)
+	}
 	webStore, e := webapp.NewStore(store.DB)
 	if e != nil {
 		t.Fatal(e)
 	}
 	s.Web = &webapp.Handler{Store: webStore}
 	h = s.Handler()
-	form := url.Values{"price_bnb": {"0.015"}}
+	form = url.Values{"price_bnb": {"0.015"}}
 	req = httptest.NewRequest("POST", "/api/web-plan", strings.NewReader(form.Encode()))
 	req.Header.Set("Origin", "http://example.com")
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")

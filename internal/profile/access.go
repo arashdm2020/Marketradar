@@ -165,12 +165,18 @@ func (s *Store) Reserve(id string, user int64, now time.Time) error {
 		return e
 	}
 	defer tx.Rollback()
+	// The authenticated owner/admin is a permanent operational exemption.  Do
+	// not require a mutable entitlement row for that invariant: otherwise the
+	// admin can lock themselves out after using the daily free analysis once.
+	active := user == AdminID
 	var exempt int
-	e = tx.QueryRow(`SELECT exempt FROM entitlements WHERE user_id=?`, user).Scan(&exempt)
-	if e != nil && e != sql.ErrNoRows {
-		return e
+	if !active {
+		e = tx.QueryRow(`SELECT exempt FROM entitlements WHERE user_id=?`, user).Scan(&exempt)
+		if e != nil && e != sql.ErrNoRows {
+			return e
+		}
+		active = exempt == 1
 	}
-	active := exempt == 1
 	accessKind := "free"
 	if active {
 		accessKind = "exempt"
@@ -216,8 +222,11 @@ func (s *Store) SetUse(id, status string) error {
 	return e
 }
 func (s *Store) SetExempt(admin, target int64, on bool) error {
-	if admin != 8697362188 {
+	if admin != AdminID {
 		return errors.New("forbidden")
+	}
+	if target == AdminID && !on {
+		return errors.New("admin exemption cannot be revoked")
 	}
 	tx, e := s.DB.Begin()
 	if e != nil {
@@ -227,6 +236,13 @@ func (s *Store) SetExempt(admin, target int64, on bool) error {
 	v := 0
 	if on {
 		v = 1
+	}
+	var exists int
+	if e = tx.QueryRow(`SELECT count(*) FROM users WHERE id=?`, target).Scan(&exists); e != nil {
+		return e
+	}
+	if exists != 1 {
+		return errors.New("user not found")
 	}
 	if _, e = tx.Exec(`INSERT INTO entitlements(user_id,exempt) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET exempt=excluded.exempt`, target, v); e != nil {
 		return e

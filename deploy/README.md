@@ -1,6 +1,6 @@
 # MarketRadar production deployment
 
-This deployment targets Ubuntu 24.04 with Docker/Compose and the existing host-networked Traefik instance. It does **not** enable Treasury sweeping. The Go service, Next.js service, and Traefik all use the host network, while the application listeners remain bound to `127.0.0.1`; no application port is publicly published by Docker.
+This deployment targets Ubuntu 24.04 with Docker/Compose and the existing host-networked Traefik instance. The Go service, Next.js service, and Traefik all use the host network, while the application listeners remain bound to `127.0.0.1`; no application port is publicly published by Docker. Production Treasury sweeping is controlled only by the protected runtime environment file.
 
 ## Architecture and routes
 
@@ -22,14 +22,17 @@ sudo chmod 600 /opt/marketradar/secrets/marketradar.env
 sudoedit /opt/marketradar/secrets/marketradar.env
 ```
 
-Set the provider credentials and a persistent `AI_CONFIG_MASTER_KEY`. Keep these deployment locks unchanged initially:
+Set the provider credentials, a persistent `AI_CONFIG_MASTER_KEY`, the public admin URL, and the explicitly approved Treasury runtime switches:
 
 ```dotenv
-TREASURY_MAINNET_ENABLED=false
+ADMIN_PUBLIC_URL=https://admin-radar.foxwd.tech/login
+TREASURY_MAINNET_ENABLED=true
 TREASURY_TESTNET_ENABLED=false
-TREASURY_SWEEP_ENABLED=false
+TREASURY_SWEEP_ENABLED=true
 WEB_BSC_TEST_INVOICES_ENABLED=false
 ```
+
+With both Mainnet switches enabled, every signable Telegram deposit wallet is balance-checked every 30 seconds. A native-BNB balance above the current 21,000-gas fee is queued once and swept to the fixed Treasury destination. An unresolved job prevents duplicate queueing and remains available for manual review. Legacy wallets without a matching private key remain non-signable.
 
 `SQLITE_PATH` and `ADMIN_LISTEN_ADDR` are enforced by Compose. Do not put private keys, the populated environment file, or database backups inside the Git checkout.
 

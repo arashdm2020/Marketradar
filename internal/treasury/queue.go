@@ -2,7 +2,11 @@ package treasury
 
 import (
 	"context"
+	"crypto/sha256"
+	"database/sql"
 	"errors"
+	"fmt"
+	"log/slog"
 	"math/big"
 	"strings"
 	"time"
@@ -19,10 +23,98 @@ type Chain interface {
 	SendRaw(context.Context, string) error
 }
 type Worker struct {
-	Store           *Store
-	Chain           Chain
-	Signer          bnb.Signer
-	ExpectedChainID uint64
+	Store             *Store
+	Chain             Chain
+	Signer            bnb.Signer
+	ExpectedChainID   uint64
+	DiscoveryInterval time.Duration
+}
+
+// DiscoverBalances queues one sweep per signable Telegram deposit wallet that
+// currently contains enough native BNB to pay a plain 21,000-gas transfer.
+// An existing non-final job for the same source suppresses duplicate queueing.
+func (w *Worker) DiscoverBalances(ctx context.Context) (int, error) {
+	if w == nil || w.Store == nil || w.Chain == nil {
+		return 0, errors.New("treasury worker unavailable")
+	}
+	chainID, e := w.Chain.ChainID(ctx)
+	if e != nil {
+		return 0, e
+	}
+	if chainID != w.ExpectedChainID {
+		return 0, errors.New("treasury network mismatch")
+	}
+	dest, e := w.Store.ActiveDestination()
+	if e != nil {
+		return 0, e
+	}
+	gasPrice, e := w.Chain.GasPrice(ctx)
+	if e != nil || gasPrice.Sign() <= 0 {
+		return 0, errors.New("invalid gas price")
+	}
+	fee := new(big.Int).Mul(gasPrice, big.NewInt(21000))
+	rows, e := w.Store.DB.Query(`SELECT address FROM telegram_wallets WHERE signable=1 AND private_key_hex!='' ORDER BY derivation_index`)
+	if e != nil {
+		return 0, e
+	}
+	var addresses []string
+	for rows.Next() {
+		var address string
+		if e = rows.Scan(&address); e != nil {
+			rows.Close()
+			return 0, e
+		}
+		addresses = append(addresses, address)
+	}
+	if e = rows.Close(); e != nil {
+		return 0, e
+	}
+	queued := 0
+	for _, address := range addresses {
+		var active int
+		e = w.Store.DB.QueryRow(`SELECT count(*) FROM treasury_jobs WHERE source=? AND status IN ('queued','preparing','signed','broadcast','broadcast_unknown','needs_review','awaiting_destination')`, address).Scan(&active)
+		if e != nil {
+			return queued, e
+		}
+		if active != 0 {
+			continue
+		}
+		balance, balanceErr := w.Chain.Balance(ctx, address)
+		if balanceErr != nil {
+			return queued, balanceErr
+		}
+		if balance.Cmp(fee) <= 0 {
+			continue
+		}
+		now := time.Now().UTC()
+		hash := sha256.Sum256([]byte(fmt.Sprintf("auto-sweep:%s:%s:%d", strings.ToLower(address), balance.String(), now.UnixNano())))
+		jobID := fmt.Sprintf("0x%x", hash[:])
+		tx, insertErr := w.Store.DB.Begin()
+		if insertErr != nil {
+			return queued, insertErr
+		}
+		if _, insertErr = tx.Exec(`INSERT INTO web_payment_events(tx_hash,address,amount_wei,block_number,block_time,classification,seen_at) VALUES(?,?,?,0,?,'balance_sweep',?)`, jobID, strings.ToLower(address), balance.String(), now.Format(time.RFC3339), now.Format(time.RFC3339)); insertErr != nil {
+			tx.Rollback()
+			return queued, insertErr
+		}
+		result, insertErr := tx.Exec(`INSERT INTO treasury_jobs(payment_hash,source,amount_wei,destination_version,status,fee_wei,updated_at) SELECT ?,?,?,?,'queued',?,? WHERE NOT EXISTS (SELECT 1 FROM treasury_jobs WHERE source=? AND status IN ('queued','preparing','signed','broadcast','broadcast_unknown','needs_review','awaiting_destination'))`, jobID, strings.ToLower(address), balance.String(), dest.Version, fee.String(), now.Format(time.RFC3339), strings.ToLower(address))
+		if insertErr != nil {
+			tx.Rollback()
+			return queued, insertErr
+		}
+		n, _ := result.RowsAffected()
+		if n != 1 {
+			tx.Rollback()
+			continue
+		}
+		if insertErr = tx.Commit(); insertErr != nil {
+			return queued, insertErr
+		}
+		if n == 1 {
+			queued++
+		}
+	}
+	return queued, nil
 }
 
 func (w *Worker) Tick(ctx context.Context) error {
@@ -137,14 +229,28 @@ func (w *Worker) Run(ctx context.Context, interval time.Duration) {
 	if interval <= 0 {
 		interval = 2 * time.Second
 	}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	processTicker := time.NewTicker(interval)
+	defer processTicker.Stop()
+	discoveryInterval := w.DiscoveryInterval
+	if discoveryInterval <= 0 {
+		discoveryInterval = 30 * time.Second
+	}
+	discoveryTicker := time.NewTicker(discoveryInterval)
+	defer discoveryTicker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			_ = w.Tick(ctx)
+		case <-discoveryTicker.C:
+			if queued, e := w.DiscoverBalances(ctx); e != nil {
+				slog.Warn("treasury_balance_discovery_failed", "error", e.Error())
+			} else if queued > 0 {
+				slog.Info("treasury_sweeps_queued", "count", queued)
+			}
+		case <-processTicker.C:
+			if e := w.Tick(ctx); e != nil && !errors.Is(e, sql.ErrNoRows) {
+				slog.Warn("treasury_tick_failed", "error", e.Error())
+			}
 		}
 	}
 }

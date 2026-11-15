@@ -26,16 +26,17 @@ import (
 )
 
 type Bot struct {
-	Token     string
-	HTTP      *http.Client
-	Store     *profile.Store
-	PlanPrice func() (*big.Int, error)
-	Engine    engine.Engine
-	Deriver   *bnb.Deriver
-	Custody   *custody.Store
-	Allowed   map[int64]bool
-	Worker    *AsyncWorker
-	Chain     bnb.Chain
+	Token          string
+	PublicAdminURL string
+	HTTP           *http.Client
+	Store          *profile.Store
+	PlanPrice      func() (*big.Int, error)
+	Engine         engine.Engine
+	Deriver        *bnb.Deriver
+	Custody        *custody.Store
+	Allowed        map[int64]bool
+	Worker         *AsyncWorker
+	Chain          bnb.Chain
 }
 type update struct {
 	UpdateID    int64 `json:"update_id"`
@@ -275,7 +276,11 @@ func (b Bot) handle(ctx context.Context, x update) {
 		}
 		code, e := b.Store.IssueAdminCode(id)
 		if e == nil {
-			_ = b.send(ctx, chat, "کد ورود پنل (اعتبار ۵ دقیقه): <code>"+code+"</code>\nآدرس پنل: http://127.0.0.1:8088", nil)
+			adminURL := strings.TrimSpace(b.PublicAdminURL)
+			if adminURL == "" {
+				adminURL = "http://127.0.0.1:3000/login"
+			}
+			_ = b.send(ctx, chat, "کد ورود پنل (اعتبار ۵ دقیقه): <code>"+code+"</code>\nآدرس پنل: "+html.EscapeString(adminURL), nil)
 		}
 		return
 	}

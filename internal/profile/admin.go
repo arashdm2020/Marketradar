@@ -44,6 +44,9 @@ func (s *Store) AdminUsers(admin int64) ([]AdminUser, error) {
 			return nil, e
 		}
 		u.Exempt = ex == 1
+		if u.ID == AdminID {
+			u.Exempt = true
+		}
 		u.FreeUsedToday = used == 1
 		if t, e := time.Parse(time.RFC3339, u.SubscriptionUntil); e == nil {
 			u.SubscriptionActive = t.After(time.Now())

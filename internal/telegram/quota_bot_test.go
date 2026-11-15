@@ -77,3 +77,30 @@ func TestStarsCheckoutAlwaysDisabled(t *testing.T) {
 		t.Fatal("Stars sale was not disabled")
 	}
 }
+
+func TestAdminCommandUsesConfiguredPublicURL(t *testing.T) {
+	store, e := profile.Open(t.TempDir() + "/admin-url.db")
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer store.DB.Close()
+	transport := &captureTransport{}
+	b := Bot{
+		Store:          store,
+		Token:          "test",
+		PublicAdminURL: "https://admin-radar.foxwd.tech/login",
+		HTTP:           &http.Client{Transport: transport},
+	}
+	var event update
+	if e = json.NewDecoder(strings.NewReader(`{"message":{"text":"/admin","chat":{"id":8697362188,"type":"private"},"from":{"id":8697362188}}}`)).Decode(&event); e != nil {
+		t.Fatal(e)
+	}
+	b.handle(context.Background(), event)
+	joined := strings.Join(transport.bodies, "\n")
+	if !strings.Contains(joined, "https://admin-radar.foxwd.tech/login") {
+		t.Fatalf("configured public admin URL missing: %s", joined)
+	}
+	if strings.Contains(joined, "127.0.0.1:8088") {
+		t.Fatal("internal Go API URL was exposed")
+	}
+}
