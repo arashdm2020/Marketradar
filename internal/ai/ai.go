@@ -27,6 +27,10 @@ type Client struct {
 	ReasoningBudget     int
 	ReasoningEffort     string
 	OnAttempt           func(Attempt)
+	Resilience          *Resilience
+	Fallback            *Client
+	FallbackEnabled     bool
+	FallbackVerified    bool
 }
 type Result struct {
 	Signal                         domain.Signal
@@ -57,6 +61,24 @@ func (c Client) Analyze(ctx context.Context, s domain.Snapshot) (Result, error) 
 	return c.AnalyzeWithContext(ctx, s, nil)
 }
 func (c Client) AnalyzeWithContext(ctx context.Context, s domain.Snapshot, userContext any) (Result, error) {
+	result, e := c.analyzePrimaryWithContext(ctx, s, userContext)
+	if e == nil || !c.FallbackEnabled {
+		return result, e
+	}
+	if c.Fallback == nil || !c.FallbackVerified {
+		return Result{}, e
+	}
+	fallback := *c.Fallback
+	if fallback.OnAttempt == nil {
+		fallback.OnAttempt = c.OnAttempt
+	}
+	if fallback.Resilience == nil {
+		fallback.Resilience = c.Resilience
+	}
+	return fallback.analyzePrimaryWithContext(ctx, s, userContext)
+}
+
+func (c Client) analyzePrimaryWithContext(ctx context.Context, s domain.Snapshot, userContext any) (Result, error) {
 	if c.Key == "" {
 		return Result{}, fmt.Errorf("NVIDIA key missing")
 	}
@@ -117,39 +139,52 @@ func (c Client) AnalyzeWithContext(ctx context.Context, s domain.Snapshot, userC
 	if provider == "google" {
 		endpoint = base + "/models/" + c.Model + ":generateContent"
 	}
-	req, e := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(body))
-	if e != nil {
-		return Result{}, e
-	}
-	if provider == "google" {
-		req.Header.Set("x-goog-api-key", c.Key)
-	} else {
-		req.Header.Set("Authorization", "Bearer "+c.Key)
-	}
-	req.Header.Set("Content-Type", "application/json")
 	start := time.Now()
 	analysisID, channel := AnalysisContext(ctx)
 	attempt := Attempt{AnalysisID: analysisID, Channel: channel, Provider: provider, Model: c.Model, StartedAt: start, Status: "transport_error"}
 	defer func() {
 		if c.OnAttempt != nil {
-			attempt.LatencyMS = time.Since(start).Milliseconds()
+			if attempt.LatencyMS == 0 {
+				attempt.LatencyMS = time.Since(attempt.StartedAt).Milliseconds()
+			}
+			attempt.TotalLatencyMS = time.Since(start).Milliseconds()
 			c.OnAttempt(attempt)
 		}
 	}()
-	resp, e := h.Do(req)
-	if e != nil {
-		return Result{}, fmt.Errorf("AI transport failure")
+	resilience := c.Resilience
+	if resilience == nil {
+		resilience = defaultResilience
 	}
-	defer resp.Body.Close()
-	attempt.HTTPStatus = resp.StatusCode
-	attempt.Status = "http_error"
-	raw, e := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	httpResult, e := resilience.execute(ctx, h, endpoint, func(requestCtx context.Context) (*http.Request, error) {
+		req, requestErr := http.NewRequestWithContext(requestCtx, "POST", endpoint, bytes.NewReader(body))
+		if requestErr != nil {
+			return nil, requestErr
+		}
+		if provider == "google" {
+			req.Header.Set("x-goog-api-key", c.Key)
+		} else {
+			req.Header.Set("Authorization", "Bearer "+c.Key)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		return req, nil
+	}, attempt, c.OnAttempt)
+	if !httpResult.Attempt.StartedAt.IsZero() {
+		attempt = httpResult.Attempt
+	}
 	if e != nil {
+		if attempt.Status == "" {
+			attempt.Status = "http_error"
+		}
+		attempt.FailureClass = string(Classify(e))
+		attempt.BreakerState = httpResult.BreakerState
+		slog.Warn("ai_inference_failed", "provider", provider, "model", c.Model, "http_status", attempt.HTTPStatus, "attempt_count", httpResult.Attempts, "total_latency_ms", httpResult.TotalLatency.Milliseconds(), "circuit_breaker", httpResult.BreakerState, "failure_class", Classify(e))
 		return Result{}, e
 	}
-	if resp.StatusCode != 200 {
-		return Result{}, fmt.Errorf("AI provider HTTP %d", resp.StatusCode)
-	}
+	raw := httpResult.Raw
+	attempt.HTTPStatus = httpResult.Status
+	attempt.AttemptCount = httpResult.Attempts
+	attempt.BreakerState = httpResult.BreakerState
+	attempt.TotalLatencyMS = httpResult.TotalLatency.Milliseconds()
 	if provider == "google" {
 		var g struct {
 			Candidates []struct {
@@ -217,7 +252,7 @@ func (c Client) AnalyzeWithContext(ctx context.Context, s domain.Snapshot, userC
 	if len(sent) < len(s.Candles) {
 		mode = "recent_window_with_full_quant"
 	}
-	slog.Info("ai_inference", "provider", provider, "model", c.Model, "prompt_tokens", wire.Usage.PromptTokens, "completion_tokens", wire.Usage.CompletionTokens, "reasoning_tokens", reasoningValue(wire.Usage.Details.ReasoningTokens), "max_tokens", maxTokens, "reasoning_budget", budget, "reasoning_effort", effort, "finish_reason", finish, "content_bytes", length, "latency_ms", time.Since(start).Milliseconds(), "input_mode", mode, "engine_candles", len(s.Candles), "model_candles", len(candles))
+	slog.Info("ai_inference", "provider", provider, "model", c.Model, "prompt_tokens", wire.Usage.PromptTokens, "completion_tokens", wire.Usage.CompletionTokens, "reasoning_tokens", reasoningValue(wire.Usage.Details.ReasoningTokens), "max_tokens", maxTokens, "reasoning_budget", budget, "reasoning_effort", effort, "finish_reason", finish, "content_bytes", length, "latency_ms", time.Since(start).Milliseconds(), "attempt_count", httpResult.Attempts, "circuit_breaker", httpResult.BreakerState, "input_mode", mode, "engine_candles", len(s.Candles), "model_candles", len(candles))
 	if len(wire.Choices) != 1 || wire.Choices[0].FinishReason != "stop" {
 		attempt.Status = "incomplete"
 		if len(wire.Choices) == 1 {

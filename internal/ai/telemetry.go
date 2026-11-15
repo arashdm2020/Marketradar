@@ -18,7 +18,8 @@ func AnalysisContext(ctx context.Context) (string, string) {
 
 type Attempt struct {
 	AnalysisID, Channel, Provider, Model, Status, FinishReason string
+	FailureClass, BreakerState                                 string
 	StartedAt                                                  time.Time
-	LatencyMS                                                  int64
-	HTTPStatus, PromptTokens, CompletionTokens                 int
+	LatencyMS, TotalLatencyMS                                  int64
+	HTTPStatus, PromptTokens, CompletionTokens, AttemptCount   int
 }

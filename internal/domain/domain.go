@@ -87,6 +87,7 @@ type Decision struct {
 	Snapshot             Snapshot           `json:"snapshot"`
 	Proposed             Signal             `json:"proposed"`
 	Final                string             `json:"final"`
+	FailureClass         string             `json:"failure_class,omitempty"`
 	Reasons              []string           `json:"reasons,omitempty"`
 	RiskReward           float64            `json:"risk_reward,omitempty"`
 	IndicativeOnly       bool               `json:"indicative_only"`

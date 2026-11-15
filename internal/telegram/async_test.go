@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"tradebot/internal/ai"
 	"tradebot/internal/catalog"
 	"tradebot/internal/domain"
 	"tradebot/internal/engine"
@@ -181,6 +182,44 @@ func TestAsyncWorkerFailingEngine(t *testing.T) {
 	}
 	if rs.Status != "failed" && rs.Status != "completed" {
 		t.Fatalf("unexpected status: %s", rs.Status)
+	}
+}
+
+func TestAsyncWorkerOverloadMessageAndQuotaRelease(t *testing.T) {
+	store, e := profile.Open(t.TempDir() + "/overload.db")
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer store.DB.Close()
+	_, _ = store.Ensure(202)
+	bot := &mockBot{}
+	eng := &mockEngine{analyzeFn: func(context.Context, engine.Request) (domain.Decision, error) {
+		return domain.Decision{Final: "ANALYSIS_UNAVAILABLE", FailureClass: string(ai.FailureOverloaded), Reasons: []string{"AI provider temporarily unavailable"}}, nil
+	}}
+	worker := NewAsyncWorker(bot, store, eng)
+	worker.Start(context.Background())
+	defer worker.Stop()
+	req := AnalysisRequest{ID: "overload-analysis", UserID: 202, ChatID: 202, Symbol: "XAU/USD", Timeframe: catalog.Timeframe("5min"), Style: "scalp"}
+	if ok, enqueueErr := worker.Enqueue(context.Background(), req); enqueueErr != nil || !ok {
+		t.Fatalf("enqueue: %v %v", ok, enqueueErr)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for worker.IsInflight(202) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if worker.IsInflight(202) {
+		t.Fatal("analysis did not terminate")
+	}
+	if !strings.Contains(strings.Join(bot.messages, "\n"), "سرویس تحلیل هوش مصنوعی موقتاً شلوغ است") {
+		t.Fatalf("specific overload message missing: %v", bot.messages)
+	}
+	var status string
+	if e = store.DB.QueryRow(`SELECT status FROM daily_uses WHERE analysis_id=?`, req.ID).Scan(&status); e != nil || status != "released" {
+		t.Fatalf("quota status=%q err=%v", status, e)
+	}
+	state, e := store.GetRequestState(req.ID)
+	if e != nil || state.Status != "failed" {
+		t.Fatalf("request state=%+v err=%v", state, e)
 	}
 }
 

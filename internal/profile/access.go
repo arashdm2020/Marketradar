@@ -53,6 +53,16 @@ func (s *Store) MigrateAccess() error {
 	if e != nil {
 		return e
 	}
+	for _, q := range []string{
+		`ALTER TABLE ai_api_attempts ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 1`,
+		`ALTER TABLE ai_api_attempts ADD COLUMN total_latency_ms INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE ai_api_attempts ADD COLUMN breaker_state TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE ai_api_attempts ADD COLUMN failure_class TEXT NOT NULL DEFAULT ''`,
+	} {
+		if _, alterErr := s.DB.Exec(q); alterErr != nil && !strings.Contains(alterErr.Error(), "duplicate column name") {
+			return alterErr
+		}
+	}
 	return nil
 }
 

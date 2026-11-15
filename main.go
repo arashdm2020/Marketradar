@@ -162,7 +162,7 @@ func run() error {
 			if a.AnalysisID == "" {
 				return
 			}
-			_, _ = store.DB.Exec(`INSERT INTO ai_api_attempts(analysis_id,channel,provider,model,status,finish_reason,http_status,started_at,latency_ms,prompt_tokens,completion_tokens) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, a.AnalysisID, a.Channel, a.Provider, a.Model, a.Status, a.FinishReason, a.HTTPStatus, a.StartedAt.UTC().Format(time.RFC3339), a.LatencyMS, a.PromptTokens, a.CompletionTokens)
+			_, _ = store.DB.Exec(`INSERT INTO ai_api_attempts(analysis_id,channel,provider,model,status,finish_reason,http_status,started_at,latency_ms,prompt_tokens,completion_tokens,attempt_count,total_latency_ms,breaker_state,failure_class) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, a.AnalysisID, a.Channel, a.Provider, a.Model, a.Status, a.FinishReason, a.HTTPStatus, a.StartedAt.UTC().Format(time.RFC3339), a.LatencyMS, a.PromptTokens, a.CompletionTokens, a.AttemptCount, a.TotalLatencyMS, a.BreakerState, a.FailureClass)
 		}
 		eng.AI.OnAttempt = recordAttempt
 		var aiStore *aimgmt.Store

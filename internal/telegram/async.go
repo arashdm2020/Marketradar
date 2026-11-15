@@ -237,7 +237,11 @@ func (w *AsyncWorker) process(ctx context.Context, req AnalysisRequest) {
 		if len(d.Reasons) > 0 {
 			reason = strings.Join(d.Reasons, "؛ ")
 		}
-		e = errors.New(reason)
+		if d.FailureClass != "" {
+			e = &ai.ProviderError{Class: ai.FailureClass(d.FailureClass), Cause: errors.New(reason)}
+		} else {
+			e = errors.New(reason)
+		}
 	}
 	deliveryCtx, deliveryCancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer deliveryCancel()
@@ -276,7 +280,10 @@ func (w *AsyncWorker) deliverFinal(ctx context.Context, req AnalysisRequest, pro
 	var result string
 	if err != nil {
 		result = customEmoji(EmojiFailure) + " <b>تحلیل تکمیل نشد</b>\n\nبه دلیل خطای فنی یا دادهٔ بازار، تصمیم معاملاتی تولید نشد. لطفاً بعداً دوباره تلاش کنید."
-		if errors.Is(err, context.DeadlineExceeded) {
+		class := ai.Classify(err)
+		if class == ai.FailureOverloaded || class == ai.FailureRateLimit || class == ai.FailureUpstream || class == ai.FailureCircuit {
+			result = customEmoji(EmojiExpiration) + " <b>سرویس تحلیل هوش مصنوعی موقتاً شلوغ است</b>\n\nداده‌های بازار دریافت شد، اما سرویس تحلیل در حال حاضر ظرفیت پاسخ‌گویی ندارد. هیچ تصمیم معاملاتی تولید نشده است؛ لطفاً چند دقیقهٔ دیگر دوباره تلاش کنید."
+		} else if errors.Is(err, context.DeadlineExceeded) || class == ai.FailureDeadline {
 			result = customEmoji(EmojiExpiration) + " <b>مهلت تحلیل به پایان رسید</b>\n\nاین پیام تصمیم معاملاتی نیست؛ لطفاً بعداً دوباره تلاش کنید."
 		}
 	} else {

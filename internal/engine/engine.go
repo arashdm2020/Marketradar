@@ -78,7 +78,7 @@ func (e Engine) Analyze(ctx context.Context, r Request) (domain.Decision, error)
 	}
 	a, err := model.AnalyzeWithContext(ctx, s, map[string]any{"style": r.Style, "min_profit_target_pct_of_entry_notional": r.MinProfit, "max_profit_target_pct_of_entry_notional": r.MaxProfit, "max_account_risk_pct": r.MaxRisk, "language": r.Language, "prediction_horizon_candles": r.HorizonCandles})
 	if err != nil {
-		return domain.Decision{Snapshot: s, Final: "ANALYSIS_UNAVAILABLE", Reasons: []string{err.Error()}, IndicativeOnly: true}, nil
+		return domain.Decision{Snapshot: s, Final: "ANALYSIS_UNAVAILABLE", FailureClass: string(ai.Classify(err)), Reasons: []string{err.Error()}, IndicativeOnly: true}, nil
 	}
 	d := risk.Validate(s, a.Signal, e.MinRR)
 	if d.Final == "WAIT" {
