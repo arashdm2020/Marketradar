@@ -1,0 +1,57 @@
+http:
+  routers:
+    marketradar-admin:
+      rule: Host(`admin-radar.foxwd.tech`)
+      entryPoints: [websecure]
+      service: marketradar-admin
+      middlewares: [marketradar-security]
+      tls:
+        certResolver: letsencrypt
+
+    marketradar-api:
+      rule: Host(`api-radar.foxwd.tech`) && (PathPrefix(`/api`) || PathPrefix(`/auth`))
+      entryPoints: [websecure]
+      service: marketradar-go
+      middlewares: [marketradar-security]
+      tls:
+        certResolver: letsencrypt
+
+    marketradar-user:
+      rule: Host(`radar.foxwd.tech`) && PathPrefix(`/app`)
+      entryPoints: [websecure]
+      service: marketradar-go
+      middlewares: [marketradar-security]
+      tls:
+        certResolver: letsencrypt
+
+    marketradar-user-root:
+      rule: Host(`radar.foxwd.tech`) && Path(`/`)
+      entryPoints: [websecure]
+      service: marketradar-go
+      middlewares: [marketradar-user-root-redirect, marketradar-security]
+      tls:
+        certResolver: letsencrypt
+
+  services:
+    marketradar-admin:
+      loadBalancer:
+        servers:
+          - url: http://127.0.0.1:3000
+    marketradar-go:
+      loadBalancer:
+        servers:
+          - url: http://127.0.0.1:8088
+
+  middlewares:
+    marketradar-user-root-redirect:
+      redirectRegex:
+        regex: ^https://radar\.foxwd\.tech/?$
+        replacement: https://radar.foxwd.tech/app/
+        permanent: true
+    marketradar-security:
+      headers:
+        contentTypeNosniff: true
+        frameDeny: true
+        referrerPolicy: no-referrer
+        stsSeconds: 31536000
+        stsIncludeSubdomains: true
