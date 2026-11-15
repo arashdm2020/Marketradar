@@ -247,7 +247,7 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	value := fmt.Sprintf("%d.%d", id, time.Now().Unix())
-	http.SetCookie(w, &http.Cookie{Name: "mr_admin", Value: value + "." + s.signed(value), Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode, Secure: r.TLS != nil, MaxAge: 43200})
+	http.SetCookie(w, &http.Cookie{Name: "mr_admin", Value: value + "." + s.signed(value), Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode, Secure: r.TLS != nil || os.Getenv("ADMIN_COOKIE_SECURE") == "true", MaxAge: 43200})
 	http.Redirect(w, r, s.redirectTarget(), http.StatusSeeOther)
 }
 func (s *Server) codeLogin(w http.ResponseWriter, r *http.Request) {
@@ -261,7 +261,7 @@ func (s *Server) codeLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	value := fmt.Sprintf("%d.%d", profile.AdminID, time.Now().Unix())
-	http.SetCookie(w, &http.Cookie{Name: "mr_admin", Value: value + "." + s.signed(value), Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode, Secure: r.TLS != nil, MaxAge: 43200})
+	http.SetCookie(w, &http.Cookie{Name: "mr_admin", Value: value + "." + s.signed(value), Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode, Secure: r.TLS != nil || os.Getenv("ADMIN_COOKIE_SECURE") == "true", MaxAge: 43200})
 	http.Redirect(w, r, s.redirectTarget(), http.StatusSeeOther)
 }
 func (s *Server) redirectTarget() string {

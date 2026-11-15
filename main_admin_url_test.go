@@ -8,6 +8,9 @@ func TestPublicAdminURLValidation(t *testing.T) {
 	if e != nil || got != "https://admin-radar.foxwd.tech/login" {
 		t.Fatalf("valid production URL rejected: %q %v", got, e)
 	}
+	if root := publicAdminRoot(got); root != "https://admin-radar.foxwd.tech/" {
+		t.Fatalf("unexpected public admin root: %s", root)
+	}
 	for _, invalid := range []string{
 		"http://admin-radar.foxwd.tech/login",
 		"https://user:pass@admin-radar.foxwd.tech/login",

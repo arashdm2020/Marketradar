@@ -14,6 +14,7 @@ services:
       - path: ${MARKETRADAR_ENV_FILE:-/opt/marketradar/secrets/marketradar.env}
         required: true
     environment:
+      ADMIN_COOKIE_SECURE: "true"
       SQLITE_PATH: /app/data/tradebot.db
       ADMIN_LISTEN_ADDR: 127.0.0.1:8088
     volumes:

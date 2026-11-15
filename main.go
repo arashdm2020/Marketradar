@@ -69,6 +69,15 @@ func publicAdminURL() (string, error) {
 	}
 	return strings.TrimRight(raw, "/"), nil
 }
+
+func publicAdminRoot(raw string) string {
+	u, e := url.Parse(raw)
+	if e != nil {
+		return raw
+	}
+	u.Path, u.RawPath, u.RawQuery, u.Fragment = "/", "", "", ""
+	return u.String()
+}
 func main() {
 	if e := run(); e != nil {
 		slog.Error("command failed", "error", e)
@@ -314,7 +323,7 @@ func run() error {
 			admin.Custody = cust
 			admin.SweepWorker = sweepWorker
 			if command == "bot" {
-				admin.NextURL = "http://127.0.0.1:3000/"
+				admin.NextURL = publicAdminRoot(adminURL)
 			}
 			server := &http.Server{Addr: addr, Handler: admin.Handler(), ReadHeaderTimeout: 5 * time.Second}
 			listener, e := net.Listen("tcp", addr)
