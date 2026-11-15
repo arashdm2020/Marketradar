@@ -1,0 +1,27 @@
+'use client';
+import {useState} from 'react';
+import {ColumnDef} from '@tanstack/react-table';
+import {Heading,Panel,Stat,Badge,State} from '@/components/ui';
+import {DataTable} from '@/components/data-table';
+import {ErrorState,Loading,useData} from '@/components/load';
+import {bnb,show,clientPost} from '@/lib/api';
+import {Treasury,TreasuryJob} from '@/lib/types';
+
+const DESTINATION='0x0F65096f6C02aA6DC0d0b8c99dDeBbc3CD90B3F5';
+
+type Wallet={telegram_id:number;index:number;address:string;created_at:string;has_key:boolean;balance_wei:string|null};
+
+export default function TreasuryPage(){
+ const t=useData<Treasury>('treasury'),w=useData<Wallet[]>('treasury/wallets'),j=useData<TreasuryJob[]>('treasury/jobs');
+ const [notice,setNotice]=useState(''),[busy,setBusy]=useState(false),[sweepBusy,setSweepBusy]=useState(false),[sweepAddr,setSweepAddr]=useState(''),[sweepCode,setSweepCode]=useState('');
+ const walletCols:ColumnDef<Wallet,unknown>[]=[{accessorKey:'telegram_id',header:'کاربر تلگرام'},{accessorKey:'index',header:'شاخص'},{accessorKey:'address',header:'آدرس واریز',cell:x=><span className="mono">{x.row.original.address}</span>},{accessorKey:'has_key',header:'قابل امضا',cell:x=><Badge value={x.row.original.has_key?'فعال':'غیرفعال'}/>},{accessorKey:'balance_wei',header:'موجودی BNB',cell:x=>bnb(x.row.original.balance_wei)},{accessorKey:'created_at',header:'ایجاد',cell:x=>show(x.row.original.created_at)}];
+ const jobCols:ColumnDef<TreasuryJob,unknown>[]=[{accessorKey:'payment_hash',header:'شناسه پرداخت',cell:x=><span className="mono">{x.row.original.payment_hash}</span>},{accessorKey:'source',header:'مبدا (صندوق کاربر)',cell:x=><span className="mono">{x.row.original.source}</span>},{accessorKey:'amount_wei',header:'مبلغ BNB',cell:x=>bnb(x.row.original.amount_wei)},{accessorKey:'status',header:'وضعیت',cell:x=><Badge value={x.row.original.status}/>},{accessorKey:'tx_hash',header:'تراکنش',cell:x=>show(x.row.original.tx_hash)},{accessorKey:'updated_at',header:'به‌روزرسانی',cell:x=>show(x.row.original.updated_at)}];
+ async function refreshBalance(){setBusy(true);setNotice('');try{await t.refresh()}catch(e){setNotice((e as Error).message)}finally{setBusy(false)}}
+ async function doManualSweep(){setSweepBusy(true);setNotice('');try{await clientPost('treasury/sweep',{admin_code:sweepCode,address:sweepAddr});setNotice('درخواست انتقال دستی ثبت شد.');setSweepCode('');setSweepAddr('');t.refresh()}catch(e){setNotice((e as Error).message)}finally{setSweepBusy(false)}}
+ const rpcHealth=t.data?.rpc_health??'not_configured';
+ const signerReady=Boolean(t.data?.signer_ready);
+ const sweepEnabled=Boolean(t.data?.sweep_enabled);
+ if(t.loading||w.loading||j.loading)return <Loading/>;
+ if(t.error||w.error||j.error)return <ErrorState message={t.error||w.error||j.error} retry={()=>{t.refresh();w.refresh();j.refresh()}} />;
+ return (<><Heading title="خزانه و صندوق‌های واریز" description="پایش خواندنی BSC؛ موجودی مقصد خزانه، صندوق‌های واریز کاربران و وضعیت انتقال‌ها."/>{notice&&<div className="notice" role="status">{notice}</div>}<div className="stats"><Stat label="مقصد خزانه" value={show(t.data?.destination?.address)}/><Stat label="موجودی مقصد" value={bnb(t.data?.mother_balance_wei)}/><Stat label="موجودی صندوق‌های کاربر" value={bnb(t.data?.deposit_balance_wei)}/><Stat label="شبکه BSC" value={rpcHealth==='healthy'?'>Mainnet (۵۶)':rpcHealth==='wrong_network'?'شبکه نادرست':'در دسترس نیست'}/><Stat label="امضاکننده" value={signerReady?'فعال':'غیرفعال'}/><Stat label="انتقال خودکار" value={sweepEnabled?'فعال':'غیرفعال'}/></div><div className="grid2"><Panel title="موجودی مقصد خزانه"><p>آدرس مقصد خزانه (ثابت): <span className="mono">{DESTINATION}</span></p><p>موجودی از شبکه BSC Mainnet خوانده شده است.</p><div className="actions"><button className="btn" disabled={busy||rpcHealth!=='healthy'} onClick={refreshBalance}>{busy?'در حال خواندن…':'تازه‌سازی موجودی'}</button></div></Panel><Panel title="وضعیت خودکار و انتقال‌ها"><p>RPC: <Badge value={rpcHealth}/></p><p>امضاکننده خزانه: <Badge value={signerReady?'فعال':'غیرفعال'}/></p><p>انتقال خودکار: <Badge value={sweepEnabled?'فعال':'غیرفعال'}/></p>{sweepEnabled?<p className="muted">تأیید هویت، مدیریت nonce و تأیید نهایی انجام شده است.</p>:<p className="muted">امضای تراکنش، مدیریت nonce و تأیید نهایی تکمیل نشده است؛ هیچ تراکنشی از این صفحه ارسال نمی‌شود.</p>}</Panel><Panel title="انتقال دستی"><p className="muted">فقط صندوق‌های واریز ثبت‌شده و Signable قابل انتقال هستند.</p><div className="form-grid"><label className="field">آدرس صندوق<input className="input ltr" value={sweepAddr} onChange={e=>setSweepAddr(e.target.value)} placeholder="آدرس واریز کاربر"/></label><label className="field">توکن تازهٔ مدیر<input className="input ltr" value={sweepCode} onChange={e=>setSweepCode(e.target.value)} placeholder="توکن UUID دستور /admin"/></label></div><div className="actions"><button className="btn" disabled={sweepBusy||!signerReady||!sweepAddr||!sweepCode} onClick={doManualSweep}>{sweepBusy?'در حال پردازش…':'ایجاد درخواست انتقال'}</button></div></Panel></div><Panel title="صندوق‌های واریز کاربران"><DataTable data={w.data||[]} columns={walletCols} search="آدرس یا کاربر" exportName="deposit-wallets"/></Panel><Panel title="تاریخچه انتقال‌های خزانه">{j.data&&j.data.length>0?<DataTable data={j.data} columns={jobCols} search="شناسه یا آدرس" exportName="treasury-jobs"/>:<State message="هنوز عملیات ثبت نشده است."/>}</Panel></>);
+}

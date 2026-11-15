@@ -1,0 +1,48 @@
+# Local environment and credentials (keep the sanitized template).
+.env
+.env.*
+.env *
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+*.keystore
+credentials/
+secrets/
+
+# Runtime state, databases, wallets, logs, and generated reports.
+data/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+*.log
+bin/
+*.exe
+analysis*.json
+backtest*.json
+
+# Frontend/build output and dependencies.
+admin-next/node_modules/
+admin-next/.next/
+node_modules/
+.next/
+dist/
+build/
+coverage/
+*.tsbuildinfo
+
+# Local backups, editor/OS temporary files, and Codex session artifacts.
+*.bak
+*.backup
+*.tmp
+*~
+.DS_Store
+Thumbs.db
+System.IO.StreamWriter
+session-*.md
+s1.md
