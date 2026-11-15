@@ -68,6 +68,56 @@ func TestStartAndMenuNeverCreateWallet(t *testing.T) {
 	}
 }
 
+func TestRepeatedStartAlwaysSendsFreshMenuAndNeverEdits(t *testing.T) {
+	s, e := profile.Open(t.TempDir() + "/fresh-menu.db")
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer s.DB.Close()
+	if _, e = s.Ensure(504); e != nil {
+		t.Fatal(e)
+	}
+	if e = s.SetDashboardMessage(504, 41); e != nil {
+		t.Fatal(e)
+	}
+	transport := &uxTransport{}
+	b := Bot{Store: s, Token: "test", HTTP: &http.Client{Transport: transport}}
+	start := telegramUpdate(t, `{"message":{"text":"/start","from":{"id":504},"chat":{"id":504,"type":"private"}}}`)
+	b.handle(context.Background(), start)
+	b.handle(context.Background(), start)
+
+	var sends, edits int
+	for _, p := range transport.paths {
+		if strings.HasSuffix(p, "/sendMessage") {
+			sends++
+		}
+		if strings.HasSuffix(p, "/editMessageText") || strings.HasSuffix(p, "/editMessageReplyMarkup") {
+			edits++
+		}
+	}
+	if sends != 2 || edits != 0 {
+		t.Fatalf("sendMessage=%d edits=%d; want one fresh send per /start and no edits", sends, edits)
+	}
+}
+
+func TestMenuCallbackStillEditsOriginatingMessage(t *testing.T) {
+	s, e := profile.Open(t.TempDir() + "/callback-menu.db")
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer s.DB.Close()
+	transport := &uxTransport{}
+	b := Bot{Store: s, Token: "test", HTTP: &http.Client{Transport: transport}}
+	b.handle(context.Background(), telegramUpdate(t, `{"callback_query":{"id":"menu1","data":"menu","from":{"id":505},"message":{"message_id":87,"chat":{"id":505,"type":"private"}}}}`))
+
+	if len(transport.paths) != 2 || !strings.HasSuffix(transport.paths[0], "/answerCallbackQuery") || !strings.HasSuffix(transport.paths[1], "/editMessageText") {
+		t.Fatalf("callback methods=%v; want answerCallbackQuery then editMessageText", transport.paths)
+	}
+	if !strings.Contains(transport.bodies[1], `"message_id":87`) {
+		t.Fatalf("callback edit did not target originating message: %s", transport.bodies[1])
+	}
+}
+
 func TestExplicitWalletCreationIsIdempotentAndOffersCopy(t *testing.T) {
 	s, e := profile.Open(t.TempDir() + "/wallet.db")
 	if e != nil {

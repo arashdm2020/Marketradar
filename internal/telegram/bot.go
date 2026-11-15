@@ -338,7 +338,11 @@ func (b Bot) handle(ctx context.Context, x update) {
 		}
 		return
 	}
-	if text == "/start" || callback == "menu" {
+	if text == "/start" {
+		b.freshMenu(ctx, chat)
+		return
+	}
+	if callback == "menu" {
 		b.menu(ctx, chat)
 		return
 	}
@@ -569,6 +573,17 @@ func dashboardAction(text, callback string) bool {
 	return callback == "help" || callback == "wallet" || callback == "wallet:refresh" || callback == "wallet:create" || callback == "payments" || strings.HasPrefix(callback, "payments:") || callback == "subscription" || callback == "buy" || callback == "my_invoices" || callback == "check_subscription" || callback == "check_payment"
 }
 func (b Bot) menu(ctx context.Context, id int64) {
+	b.renderMenu(ctx, id, false)
+}
+
+// freshMenu deliberately bypasses the stored dashboard message. An explicit
+// /start is a request for a new conversation entry, while callback navigation
+// should continue editing the message that originated the callback.
+func (b Bot) freshMenu(ctx context.Context, id int64) {
+	b.renderMenu(ctx, id, true)
+}
+
+func (b Bot) renderMenu(ctx context.Context, id int64, forceNew bool) {
 	active, until, _ := b.Store.Subscription(id)
 	status := "غیرفعال"
 	if active {
@@ -582,11 +597,19 @@ func (b Bot) menu(ctx context.Context, id int64) {
 		customEmoji(EmojiSuccess) + " وضعیت اشتراک: <b>" + html.EscapeString(status) + "</b>\n" +
 		customEmoji(EmojiBNB) + " کیف‌پول BSC: <b>" + wallet + "</b>\n\n" +
 		"یک گزینه را انتخاب کنید:"
-	_ = b.screen(ctx, id, msg, [][]map[string]any{
+	buttons := [][]map[string]any{
 		{button("📈 تحلیل بازار", "analyze"), button("💎 اشتراک من", "subscription")},
 		{button("👛 کیف‌پول من", "wallet"), button("💳 پرداخت‌ها", "payments")},
 		{button("⚙️ تنظیمات", "settings"), button("❓ راهنما", "help")},
-	})
+	}
+	if !forceNew {
+		_ = b.screen(ctx, id, msg, buttons)
+		return
+	}
+	messageID, e := b.sendWithResult(ctx, id, msg, buttons, true)
+	if e == nil && b.Store != nil && messageID > 0 {
+		_ = b.Store.SetDashboardMessage(id, messageID)
+	}
 }
 func partsFromState(s string) []string { return strings.Split(strings.TrimPrefix(s, "confirm:"), ":") }
 func selectionLabel(parts []string) string {
