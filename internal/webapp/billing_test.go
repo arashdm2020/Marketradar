@@ -130,6 +130,28 @@ func testStores(t *testing.T) (*profile.Store, *Store) {
 	}
 	return p, w
 }
+
+func seedCheckoutWallet(t *testing.T, p *profile.Store, web *Store, webID, telegramID int64) string {
+	t.Helper()
+	if _, err := p.Ensure(telegramID); err != nil {
+		t.Fatal(err)
+	}
+	address := fmt.Sprintf("0x%040x", telegramID)
+	_, err := p.DB.Exec(`INSERT OR IGNORE INTO telegram_wallets(telegram_id,derivation_index,address,created_at,signable) VALUES(?,-1,?,?,1)`, telegramID, address, time.Now().UTC().Format(time.RFC3339))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = p.TelegramForWebUser(webID); err != nil {
+		token, issueErr := p.IssueWebLink(telegramID, time.Now())
+		if issueErr != nil {
+			t.Fatal(issueErr)
+		}
+		if issueErr = p.ConsumeWebLink(token, webID, time.Now()); issueErr != nil {
+			t.Fatal(issueErr)
+		}
+	}
+	return address
+}
 func addPayment(c *fakeChain, n uint64, at time.Time, to, amount string, txID int) {
 	hash := fmt.Sprintf("0x%064x", txID)
 	blockHash := fmt.Sprintf("0x%064x", n)
@@ -199,7 +221,10 @@ func TestInvoiceSettlementAndWebAnalysis(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	tgID, _ := p.Ensure(9002)
+	tgID := int64(9002)
+	if _, e := p.Ensure(tgID); e != nil {
+		t.Fatal(e)
+	}
 	_ = tgID
 	if _, e = p.WalletRecordForWeb(user); e == nil {
 		t.Fatal("unlinked web user unexpectedly had shared wallet")
@@ -208,14 +233,15 @@ func TestInvoiceSettlementAndWebAnalysis(t *testing.T) {
 	if e = p.ConsumeWebLink(linkToken, user, time.Now()); e != nil {
 		t.Fatal(e)
 	}
+	seedCheckoutWallet(t, p, s, user, 9002)
 	if e = p.ActivateOnce(9002, "seed-web-plan", "test", time.Now().Add(-time.Hour)); e != nil {
 		t.Fatal(e)
 	}
 	if e = s.SetPrice(profile.AdminID, "0.01"); e != nil {
 		t.Fatal(e)
 	}
-	chain := &fakeChain{head: 100, blocks: map[uint64]bnb.Block{}, receipts: map[string]bnb.Receipt{}, chainID: 97}
-	billing := Billing{Store: s, Deriver: testDeriver(t), Chain: chain, ExpectedChainID: 97, Confirmations: 12, ReferenceVerified: true}
+	chain := &fakeChain{head: 100, blocks: map[uint64]bnb.Block{}, receipts: map[string]bnb.Receipt{}, chainID: 56}
+	billing := Billing{Store: s, Profile: p, Deriver: testDeriver(t), Chain: chain, ExpectedChainID: 56, Confirmations: 12, ReferenceVerified: true}
 	billing.TestInvoicesEnabled = true
 	billing.TestEmail = "user@example.com"
 	now := time.Now().UTC().Truncate(time.Second)
@@ -223,7 +249,7 @@ func TestInvoiceSettlementAndWebAnalysis(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	if inv.ChainID != 97 || inv.PriceWei != "10000000000000000" || inv.ExpiresAt.Sub(inv.CreatedAt) != 15*time.Minute {
+	if inv.ChainID != 56 || inv.PriceWei != "10000000000000000" || inv.ExpiresAt.Sub(inv.CreatedAt) < 14*time.Minute+59*time.Second || inv.ExpiresAt.Sub(inv.CreatedAt) > 15*time.Minute {
 		t.Fatalf("bad invoice: %+v", inv)
 	}
 	addPayment(chain, 101, now.Add(2*time.Minute), inv.Address, "0x2386f26fc10000", 1)
@@ -231,19 +257,19 @@ func TestInvoiceSettlementAndWebAnalysis(t *testing.T) {
 	if _, e = billing.ScanOnce(context.Background()); e != nil {
 		t.Fatal(e)
 	}
-	paid, e := s.Invoice(user, inv.ID)
+	paid, e := billing.InvoiceForWebUser(user, inv.ID)
 	if e != nil || paid.Status != "paid" {
 		t.Fatalf("not paid: %+v %v", paid, e)
 	}
-	until, e := s.Subscription(user)
-	if e != nil || !until.After(time.Now()) {
+	active, until, e := p.Subscription(tgID)
+	if e != nil || !active || !until.After(time.Now()) {
 		t.Fatal("subscription not activated")
 	}
 	_, _ = s.DB.Exec(`UPDATE web_chain_scan SET cursor=100 WHERE id=1`)
 	if _, e = billing.ScanOnce(context.Background()); e != nil {
 		t.Fatal(e)
 	}
-	again, _ := s.Subscription(user)
+	_, again, _ := p.Subscription(tgID)
 	if !again.Equal(until) {
 		t.Fatal("duplicate transaction extended subscription")
 	}
@@ -273,6 +299,7 @@ func TestConcurrentInvoiceOneAddressAndManualReview(t *testing.T) {
 	p, s := testStores(t)
 	defer p.DB.Close()
 	user, _ := s.Register("other@example.com", "another-long-password")
+	seedCheckoutWallet(t, p, s, user, 9003)
 	_ = s.SetPrice(profile.AdminID, "0.02")
 	chain := &fakeChain{head: 200, blocks: map[uint64]bnb.Block{}, receipts: map[string]bnb.Receipt{}, chainID: 56}
 	billing := Billing{Store: s, Deriver: testDeriver(t), Chain: chain, ExpectedChainID: 56, Confirmations: 2, ReferenceVerified: true}
@@ -306,12 +333,13 @@ func TestConcurrentInvoiceOneAddressAndManualReview(t *testing.T) {
 			t.Fatal("duplicate invoices")
 		}
 	}
-	var wallets int
-	_ = s.DB.QueryRow(`SELECT count(*) FROM web_wallets WHERE user_id=?`, user).Scan(&wallets)
-	if wallets != 1 {
-		t.Fatalf("wallets=%d", wallets)
+	var wallets, parallelWallets int
+	_ = p.DB.QueryRow(`SELECT count(*) FROM telegram_wallets WHERE telegram_id=9003`).Scan(&wallets)
+	_ = s.DB.QueryRow(`SELECT count(*) FROM web_wallets WHERE user_id=?`, user).Scan(&parallelWallets)
+	if wallets != 1 || parallelWallets != 0 {
+		t.Fatalf("shared wallets=%d parallel web wallets=%d", wallets, parallelWallets)
 	}
-	inv, _ := s.Invoice(user, first)
+	inv, _ := billing.InvoiceForWebUser(user, first)
 	addPayment(chain, 201, now.Add(time.Minute), inv.Address, "0x1", 2)
 	chain.head = 202
 	if _, e := billing.ScanOnce(context.Background()); e != nil {
@@ -341,9 +369,10 @@ func TestConfirmedAfterExpiryUsesBlockTime(t *testing.T) {
 	p, s := testStores(t)
 	defer p.DB.Close()
 	user, _ := s.Register("lateconfirm@example.com", "long-test-password")
+	seedCheckoutWallet(t, p, s, user, 9004)
 	_ = s.SetPrice(profile.AdminID, "0.01")
-	chain := &fakeChain{head: 100, chainID: 97, blocks: map[uint64]bnb.Block{}, receipts: map[string]bnb.Receipt{}}
-	billing := Billing{Store: s, Deriver: testDeriver(t), Chain: chain, ExpectedChainID: 97, Confirmations: 12, ReferenceVerified: true}
+	chain := &fakeChain{head: 100, chainID: 56, blocks: map[uint64]bnb.Block{}, receipts: map[string]bnb.Receipt{}}
+	billing := Billing{Store: s, Profile: p, Deriver: testDeriver(t), Chain: chain, ExpectedChainID: 56, Confirmations: 12, ReferenceVerified: true}
 	billing.TestInvoicesEnabled = true
 	billing.TestEmail = "lateconfirm@example.com"
 	now := time.Now().UTC().Truncate(time.Second)
@@ -353,22 +382,25 @@ func TestConfirmedAfterExpiryUsesBlockTime(t *testing.T) {
 	}
 	addPayment(chain, 101, now.Add(14*time.Minute), first.Address, "0x2386f26fc10000", 20)
 	chain.head = 101
+	if _, e = p.DB.Exec(`UPDATE telegram_invoices SET status='expired',expires_at=? WHERE id=?`, now.Add(15*time.Minute).Add(-time.Second).Format(time.RFC3339), first.ID); e != nil {
+		t.Fatal(e)
+	}
 	second, e := billing.CreateInvoice(context.Background(), user, now.Add(16*time.Minute))
 	if e != nil {
 		t.Fatal(e)
 	}
 	if second.Address != first.Address || second.ID == first.ID {
-		t.Fatal("address changed or invoice reused")
+		t.Fatal("address changed or expired invoice was reused")
 	}
 	chain.head = 112
 	if _, e = billing.ScanOnce(context.Background()); e != nil {
 		t.Fatal(e)
 	}
-	paid, _ := s.Invoice(user, first.ID)
+	paid, _ := billing.InvoiceForWebUser(user, first.ID)
 	if paid.Status != "paid" {
 		t.Fatalf("in-window block paid after expiry not accepted: %s", paid.Status)
 	}
-	pending, _ := s.Invoice(user, second.ID)
+	pending, _ := billing.InvoiceForWebUser(user, second.ID)
 	if pending.Status != "pending" {
 		t.Fatal("new invoice modified")
 	}
@@ -378,8 +410,9 @@ func TestWrongNetworkPreventsInvoice(t *testing.T) {
 	defer p.DB.Close()
 	user, _ := s.Register("wrongnet@example.com", "long-test-password")
 	_ = s.SetPrice(profile.AdminID, "0.01")
-	chain := &fakeChain{head: 100, chainID: 56, blocks: map[uint64]bnb.Block{}, receipts: map[string]bnb.Receipt{}}
-	billing := Billing{Store: s, Deriver: testDeriver(t), Chain: chain, ExpectedChainID: 97, Confirmations: 12, ReferenceVerified: true}
+	seedCheckoutWallet(t, p, s, user, 9005)
+	chain := &fakeChain{head: 100, chainID: 97, blocks: map[uint64]bnb.Block{}, receipts: map[string]bnb.Receipt{}}
+	billing := Billing{Store: s, Profile: p, Deriver: testDeriver(t), Chain: chain, ExpectedChainID: 56, Confirmations: 12, ReferenceVerified: true}
 	billing.TestInvoicesEnabled = true
 	billing.TestEmail = "wrongnet@example.com"
 	if _, e := billing.CreateInvoice(context.Background(), user, time.Now()); e == nil {
@@ -416,6 +449,7 @@ func TestPublicInvoicingClosed(t *testing.T) {
 	defer p.DB.Close()
 	allowed, _ := s.Register("pilot@example.com", "long-test-password")
 	other, _ := s.Register("otherpilot@example.com", "long-test-password")
+	seedCheckoutWallet(t, p, s, allowed, 9006)
 	_ = s.SetPrice(profile.AdminID, "0.01")
 	chain := &fakeChain{head: 100, chainID: 56, blocks: map[uint64]bnb.Block{}, receipts: map[string]bnb.Receipt{}}
 	billing := Billing{Store: s, Deriver: testDeriver(t), Chain: chain, ExpectedChainID: 56, Confirmations: 12, ReferenceVerified: true}
@@ -435,6 +469,7 @@ func TestPaymentRecoveredAfterRPCOutage(t *testing.T) {
 	p, s := testStores(t)
 	defer p.DB.Close()
 	user, _ := s.Register("recovery@example.com", "long-test-password")
+	seedCheckoutWallet(t, p, s, user, 9007)
 	_ = s.SetPrice(profile.AdminID, "0.01")
 	chain := &fakeChain{head: 100, chainID: 56, blocks: map[uint64]bnb.Block{}, receipts: map[string]bnb.Receipt{}}
 	billing := Billing{Store: s, Deriver: testDeriver(t), Chain: chain, ExpectedChainID: 56, Confirmations: 2, ReferenceVerified: true, TestInvoicesEnabled: true, TestEmail: "recovery@example.com"}
@@ -465,12 +500,13 @@ func TestPaymentRecoveredAfterRPCOutage(t *testing.T) {
 	if _, e = billing.ScanOnce(context.Background()); e != nil {
 		t.Fatal(e)
 	}
-	paid, _ := s.Invoice(user, invoice.ID)
+	paid, _ := billing.InvoiceForWebUser(user, invoice.ID)
 	if paid.Status != "paid" {
 		t.Fatalf("payment not recovered: %s", paid.Status)
 	}
-	until, _ := s.Subscription(user)
-	if !until.After(time.Now()) {
+	tgID, _ := p.TelegramForWebUser(user)
+	active, until, _ := p.Subscription(tgID)
+	if !active || !until.After(time.Now()) {
 		t.Fatal("subscription not active after recovery")
 	}
 }

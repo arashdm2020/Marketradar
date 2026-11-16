@@ -65,8 +65,9 @@ func TestQuotaLinkInvoicePaymentAndExpiry(t *testing.T) {
 	if e := p.Reserve("third", telegramID, now); !errors.Is(e, profile.ErrQuota) {
 		t.Fatalf("link without payment bypassed quota: %v", e)
 	}
-	chain := &fakeChain{head: 300, chainID: 97, blocks: map[uint64]bnb.Block{}, receipts: map[string]bnb.Receipt{}}
-	b := &Billing{Store: web, Deriver: testDeriver(t), Chain: chain, ExpectedChainID: 97, Confirmations: 2, ReferenceVerified: true, TestInvoicesEnabled: true, TestEmail: "linked@example.com"}
+	seedCheckoutWallet(t, p, web, webUser, telegramID)
+	chain := &fakeChain{head: 300, chainID: 56, blocks: map[uint64]bnb.Block{}, receipts: map[string]bnb.Receipt{}}
+	b := &Billing{Store: web, Profile: p, Deriver: testDeriver(t), Chain: chain, ExpectedChainID: 56, Confirmations: 2, ReferenceVerified: true, TestInvoicesEnabled: true, TestEmail: "linked@example.com"}
 	if e := web.SetPrice(profile.AdminID, "0.01"); e != nil {
 		t.Fatal(e)
 	}
@@ -79,8 +80,8 @@ func TestQuotaLinkInvoicePaymentAndExpiry(t *testing.T) {
 	if _, e := b.ScanOnce(context.Background()); e != nil {
 		t.Fatal(e)
 	}
-	_, before, e := p.WebSubscription(telegramID)
-	if e != nil || !before.After(now) {
+	active, before, e := p.Subscription(telegramID)
+	if e != nil || !active || !before.After(now) {
 		t.Fatalf("payment not linked: %v %v", before, e)
 	}
 	transport := &telegramDeliveryStub{}
@@ -112,7 +113,7 @@ func TestQuotaLinkInvoicePaymentAndExpiry(t *testing.T) {
 	if _, e := b.ScanOnce(context.Background()); e != nil {
 		t.Fatal(e)
 	}
-	_, after, e := p.WebSubscription(telegramID)
+	_, after, e := p.Subscription(telegramID)
 	if e != nil || !before.Equal(after) {
 		t.Fatalf("duplicate renewal: %v to %v, %v", before, after, e)
 	}

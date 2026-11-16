@@ -194,7 +194,7 @@ func run() error {
 		if e = treasuryStore.Recover(); e != nil {
 			return e
 		}
-		billing := &webapp.Billing{Store: webStore, ExpectedChainID: 56, Confirmations: 12}
+		billing := &webapp.Billing{Store: webStore, Profile: store, ExpectedChainID: 56, Confirmations: 12}
 		var openRPC func([]byte) (string, error)
 		if aiStore != nil {
 			openRPC = aiStore.OpenSecret

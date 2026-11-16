@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 	"tradebot/internal/domain"
+	"tradebot/internal/entitlement"
 	"tradebot/internal/profile"
 	"tradebot/internal/telegram"
 )
@@ -83,6 +84,8 @@ func (h *Handler) Routes() http.Handler {
 	m.HandleFunc("/app/api/telegram/nonce", h.telegramNonce)
 	m.HandleFunc("/app/api/telegram/callback", h.telegramCallback)
 	m.HandleFunc("/app/api/invoice", h.invoice)
+	m.HandleFunc("/app/api/billing/history", h.billingHistory)
+	m.HandleFunc("/app/api/wallet/activity", h.walletActivity)
 	m.HandleFunc("/app/api/analyze", h.analyze)
 	m.HandleFunc("/app/api/analysis", h.analysis)
 	m.HandleFunc("/app/api/analyses", h.analyses)
@@ -274,16 +277,27 @@ func (h *Handler) me(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "profile unavailable", 500)
 		return
 	}
-	address := ""
+	address, walletCreated := "", ""
+	balance, balanceStatus := "", "wallet_not_found"
 	if wallet, walletErr := h.Profile.WalletRecordForTelegram(tgID); walletErr == nil {
-		address = wallet.Address
+		address, walletCreated = wallet.Address, wallet.CreatedAt
+		balanceStatus = "rpc_not_configured"
 	}
-	balance := ""
+	actualChainID := uint64(0)
 	if address != "" && h.Billing != nil && h.Billing.Chain != nil {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-		if chainID, chainErr := h.Billing.Chain.ChainID(ctx); chainErr == nil && chainID == h.Billing.ExpectedChainID {
+		if chainID, chainErr := h.Billing.Chain.ChainID(ctx); chainErr != nil {
+			balanceStatus = "rpc_unavailable"
+		} else if chainID != 56 || chainID != h.Billing.ExpectedChainID {
+			actualChainID = chainID
+			balanceStatus = "wrong_network"
+		} else {
+			actualChainID = chainID
 			if amount, balanceErr := h.Billing.Chain.Balance(ctx, address); balanceErr == nil {
 				balance = formatBNB(amount)
+				balanceStatus = "available"
+			} else {
+				balanceStatus = "rpc_unavailable"
 			}
 		}
 		cancel()
@@ -302,10 +316,36 @@ func (h *Handler) me(w http.ResponseWriter, r *http.Request) {
 		network = "BNB Smart Chain Testnet"
 	}
 	invoiceAvailable := false
-	if ready && h.Billing.TestInvoicesEnabled {
-		var email string
-		invoiceAvailable = h.Store.DB.QueryRow(`SELECT email FROM web_users WHERE id=?`, id).Scan(&email) == nil && normalizeEmail(email) == normalizeEmail(h.Billing.TestEmail)
+	invoiceUnavailableReason := "billing_not_configured"
+	if ready {
+		switch {
+		case priceErr != nil:
+			invoiceUnavailableReason = "price_not_configured"
+		case !h.Billing.PublicInvoicesEnabled && !h.Billing.TestInvoicesEnabled:
+			invoiceUnavailableReason = "invoicing_disabled"
+		case !h.Billing.PublicInvoicesEnabled && h.Billing.TestInvoicesEnabled:
+			var email string
+			if h.Store.DB.QueryRow(`SELECT email FROM web_users WHERE id=?`, id).Scan(&email) != nil || normalizeEmail(email) != normalizeEmail(h.Billing.TestEmail) {
+				invoiceUnavailableReason = "private_test_only"
+			} else if wallet, walletErr := h.Profile.WalletRecordForTelegram(tgID); walletErr != nil || !wallet.Signable {
+				invoiceUnavailableReason = "wallet_not_eligible"
+			} else if actualChainID != 56 || balanceStatus != "available" {
+				invoiceUnavailableReason = "rpc_unavailable"
+			} else {
+				invoiceAvailable = true
+			}
+		default:
+			if wallet, walletErr := h.Profile.WalletRecordForTelegram(tgID); walletErr != nil || !wallet.Signable {
+				invoiceUnavailableReason = "wallet_not_eligible"
+			} else if actualChainID != 56 || balanceStatus != "available" {
+				invoiceUnavailableReason = "rpc_unavailable"
+			} else {
+				invoiceAvailable = true
+			}
+		}
 	}
+	var latestPaymentAt string
+	_ = h.Profile.DB.QueryRow(`SELECT COALESCE(MAX(created_at),'') FROM payment_events WHERE user_id=? AND kind='bnb_telegram'`, tgID).Scan(&latestPaymentAt)
 	v := map[string]any{
 		"profile": map[string]any{
 			"telegram_id": tgID, "first_name": telegramProfile.FirstName, "last_name": telegramProfile.LastName,
@@ -315,11 +355,13 @@ func (h *Handler) me(w http.ResponseWriter, r *http.Request) {
 		},
 		"subscription":  map[string]any{"plan": access.Policy.Label, "active": access.SubscriptionActive, "until": access.SubscriptionUntil},
 		"quota":         map[string]any{"daily_allowance": access.Allowance, "used": access.Used, "remaining": access.Remaining, "exempt": access.Exempt},
-		"wallet":        map[string]any{"address": address, "network": network, "chain_id": chainID, "balance_bnb": balance},
-		"billing_ready": ready, "invoice_available": invoiceAvailable,
+		"wallet":        map[string]any{"address": address, "created_at": walletCreated, "network": network, "chain_id": chainID, "actual_chain_id": actualChainID, "balance_bnb": balance, "balance_status": balanceStatus},
+		"billing_ready": ready, "invoice_available": invoiceAvailable, "invoice_unavailable_reason": invoiceUnavailableReason, "latest_payment_at": latestPaymentAt,
+		"plan_allowances": map[string]int{"visitor": entitlement.Defaults[entitlement.Visitor].DailyAllowance, "standard": entitlement.Defaults[entitlement.Standard].DailyAllowance, "premium": entitlement.Defaults[entitlement.Premium].DailyAllowance},
 	}
 	if priceErr == nil {
 		v["price_wei"] = price.String()
+		v["standard_price_wei"] = price.String()
 	}
 	out(w, v)
 }
@@ -390,12 +432,24 @@ func (h *Handler) invoice(w http.ResponseWriter, r *http.Request) {
 		if !ok {
 			return
 		}
-		v, e := h.Store.Invoice(id, r.URL.Query().Get("id"))
+		if !h.allowBillingRequest(w, id, "invoice_status", 60, time.Minute) {
+			return
+		}
+		if h.Billing == nil {
+			http.Error(w, "billing unavailable", 503)
+			return
+		}
+		v, e := h.Billing.InvoiceForWebUser(id, r.URL.Query().Get("id"))
 		if e != nil {
 			http.Error(w, "not found", 404)
 			return
 		}
 		out(w, v)
+		return
+	}
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "GET, POST")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 	if !sameOrigin(w, r) {
@@ -405,6 +459,17 @@ func (h *Handler) invoice(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if !h.allowBillingRequest(w, id, "invoice_create", 3, 10*time.Minute) {
+		return
+	}
+	if h.Billing == nil {
+		http.Error(w, "billing unavailable", 503)
+		return
+	}
+	if plan := strings.ToLower(strings.TrimSpace(r.FormValue("plan_id"))); plan != "" && plan != "standard" {
+		http.Error(w, "this plan does not have a configured web price", http.StatusConflict)
+		return
+	}
 	v, e := h.Billing.CreateInvoice(r.Context(), id, time.Now())
 	if e != nil {
 		http.Error(w, "invoice unavailable: "+e.Error(), 503)
@@ -412,6 +477,105 @@ func (h *Handler) invoice(w http.ResponseWriter, r *http.Request) {
 	}
 	out(w, v)
 }
+
+func (h *Handler) billingHistory(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	id, ok := h.require(w, r)
+	if !ok {
+		return
+	}
+	if !h.allowBillingRequest(w, id, "billing_history", 30, time.Minute) {
+		return
+	}
+	if h.Profile == nil {
+		http.Error(w, "billing unavailable", 503)
+		return
+	}
+	tgID, err := h.Profile.TelegramForWebUser(id)
+	if err != nil {
+		http.Error(w, "Telegram account not linked", 403)
+		return
+	}
+	page := 1
+	if raw := r.URL.Query().Get("page"); raw != "" {
+		n, e := strconv.Atoi(raw)
+		if e != nil || n < 1 || n > 10000 {
+			http.Error(w, "invalid page", 400)
+			return
+		}
+		page = n
+	}
+	items, total, err := h.Profile.PageTelegramBilling(tgID, 10, (page-1)*10, r.URL.Query().Get("status"))
+	if err != nil {
+		http.Error(w, "billing history unavailable", 400)
+		return
+	}
+	out(w, map[string]any{"items": items, "page": page, "page_size": 10, "total": total, "has_next": page*10 < total})
+}
+
+func (h *Handler) walletActivity(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	id, ok := h.require(w, r)
+	if !ok {
+		return
+	}
+	if !h.allowBillingRequest(w, id, "wallet_activity", 30, time.Minute) {
+		return
+	}
+	if h.Profile == nil {
+		http.Error(w, "wallet unavailable", 503)
+		return
+	}
+	tgID, err := h.Profile.TelegramForWebUser(id)
+	if err != nil {
+		http.Error(w, "Telegram account not linked", 403)
+		return
+	}
+	page := 1
+	if raw := r.URL.Query().Get("page"); raw != "" {
+		n, e := strconv.Atoi(raw)
+		if e != nil || n < 1 || n > 10000 {
+			http.Error(w, "invalid page", 400)
+			return
+		}
+		page = n
+	}
+	items, total, err := h.Profile.WalletActivity(tgID, 20, (page-1)*20)
+	if err != nil {
+		http.Error(w, "wallet activity unavailable", 404)
+		return
+	}
+	out(w, map[string]any{"items": items, "page": page, "page_size": 20, "total": total, "has_next": page*20 < total})
+}
+
+func (h *Handler) allowBillingRequest(w http.ResponseWriter, userID int64, operation string, limit int, window time.Duration) bool {
+	if h.Store == nil {
+		http.Error(w, "billing unavailable", http.StatusServiceUnavailable)
+		return false
+	}
+	allowed, err := h.Store.AllowUserRequest(userID, operation, limit, window, time.Now())
+	if err != nil {
+		http.Error(w, "request limit unavailable", http.StatusServiceUnavailable)
+		return false
+	}
+	if !allowed {
+		w.Header().Set("Retry-After", "60")
+		http.Error(w, "too many requests", http.StatusTooManyRequests)
+		return false
+	}
+	return true
+}
+
 func (h *Handler) analyze(w http.ResponseWriter, r *http.Request) {
 	if !sameOrigin(w, r) {
 		return

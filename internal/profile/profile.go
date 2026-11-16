@@ -35,6 +35,7 @@ type Alert struct {
 type TelegramInvoice struct {
 	ID         string    `json:"id"`
 	TelegramID int64     `json:"-"`
+	PlanID     string    `json:"plan_id"`
 	Address    string    `json:"address"`
 	PriceWei   string    `json:"price_wei"`
 	ChainID    uint64    `json:"chain_id"`
@@ -300,7 +301,7 @@ func (s *Store) CreateTelegramInvoice(telegramID int64, address, priceWei string
 	}
 	var existing TelegramInvoice
 	var created, expires, updated string
-	e = tx.QueryRow(`SELECT id,telegram_id,address,price_wei,chain_id,created_at,expires_at,start_block,status,tx_hash,updated_at FROM telegram_invoices WHERE telegram_id=? AND status='pending'`, telegramID).Scan(&existing.ID, &existing.TelegramID, &existing.Address, &existing.PriceWei, &existing.ChainID, &created, &expires, &existing.StartBlock, &existing.Status, &existing.TxHash, &updated)
+	e = tx.QueryRow(`SELECT id,telegram_id,plan_id,address,price_wei,chain_id,created_at,expires_at,start_block,status,tx_hash,updated_at FROM telegram_invoices WHERE telegram_id=? AND status='pending'`, telegramID).Scan(&existing.ID, &existing.TelegramID, &existing.PlanID, &existing.Address, &existing.PriceWei, &existing.ChainID, &created, &expires, &existing.StartBlock, &existing.Status, &existing.TxHash, &updated)
 	if e == nil {
 		existing.CreatedAt, _ = time.Parse(time.RFC3339, created)
 		existing.ExpiresAt, _ = time.Parse(time.RFC3339, expires)
@@ -310,19 +311,19 @@ func (s *Store) CreateTelegramInvoice(telegramID int64, address, priceWei string
 	if e != sql.ErrNoRows {
 		return TelegramInvoice{}, e
 	}
-	_, e = tx.Exec(`INSERT INTO telegram_invoices(id,telegram_id,address,price_wei,chain_id,created_at,expires_at,start_block,status,updated_at) VALUES(?,?,?,?,?,?,?,?,'pending',?)`, id, telegramID, address, priceWei, chainID, now.Format(time.RFC3339), expiresAt.UTC().Format(time.RFC3339), startBlock, now.Format(time.RFC3339))
+	_, e = tx.Exec(`INSERT INTO telegram_invoices(id,telegram_id,plan_id,address,price_wei,chain_id,created_at,expires_at,start_block,status,updated_at) VALUES(?,?,'standard',?,?,?,?,?,?,'pending',?)`, id, telegramID, address, priceWei, chainID, now.Format(time.RFC3339), expiresAt.UTC().Format(time.RFC3339), startBlock, now.Format(time.RFC3339))
 	if e != nil {
 		return TelegramInvoice{}, e
 	}
 	if e = tx.Commit(); e != nil {
 		return TelegramInvoice{}, e
 	}
-	return TelegramInvoice{ID: id, TelegramID: telegramID, Address: address, PriceWei: priceWei, ChainID: chainID, CreatedAt: now, ExpiresAt: expiresAt.UTC(), StartBlock: startBlock, Status: "pending", UpdatedAt: now}, nil
+	return TelegramInvoice{ID: id, TelegramID: telegramID, PlanID: "standard", Address: address, PriceWei: priceWei, ChainID: chainID, CreatedAt: now, ExpiresAt: expiresAt.UTC(), StartBlock: startBlock, Status: "pending", UpdatedAt: now}, nil
 }
 func (s *Store) TelegramInvoice(telegramID int64, id string) (TelegramInvoice, error) {
 	var inv TelegramInvoice
 	var created, expires, updated string
-	e := s.DB.QueryRow(`SELECT id,telegram_id,address,price_wei,chain_id,created_at,expires_at,start_block,status,tx_hash,updated_at FROM telegram_invoices WHERE id=? AND telegram_id=?`, id, telegramID).Scan(&inv.ID, &inv.TelegramID, &inv.Address, &inv.PriceWei, &inv.ChainID, &created, &expires, &inv.StartBlock, &inv.Status, &inv.TxHash, &updated)
+	e := s.DB.QueryRow(`SELECT id,telegram_id,plan_id,address,price_wei,chain_id,created_at,expires_at,start_block,status,tx_hash,updated_at FROM telegram_invoices WHERE id=? AND telegram_id=?`, id, telegramID).Scan(&inv.ID, &inv.TelegramID, &inv.PlanID, &inv.Address, &inv.PriceWei, &inv.ChainID, &created, &expires, &inv.StartBlock, &inv.Status, &inv.TxHash, &updated)
 	if e != nil {
 		return inv, e
 	}
@@ -338,7 +339,7 @@ func (s *Store) TelegramInvoice(telegramID int64, id string) (TelegramInvoice, e
 func (s *Store) ListTelegramInvoices(telegramID int64) ([]TelegramInvoice, error) {
 	now := time.Now().UTC().Format(time.RFC3339)
 	_, _ = s.DB.Exec(`UPDATE telegram_invoices SET status='expired',updated_at=? WHERE telegram_id=? AND status='pending' AND expires_at<=?`, now, telegramID, now)
-	rows, e := s.DB.Query(`SELECT id,telegram_id,address,price_wei,chain_id,created_at,expires_at,start_block,status,tx_hash,updated_at FROM telegram_invoices WHERE telegram_id=? ORDER BY created_at DESC LIMIT 100`, telegramID)
+	rows, e := s.DB.Query(`SELECT id,telegram_id,plan_id,address,price_wei,chain_id,created_at,expires_at,start_block,status,tx_hash,updated_at FROM telegram_invoices WHERE telegram_id=? ORDER BY created_at DESC LIMIT 100`, telegramID)
 	if e != nil {
 		return nil, e
 	}
@@ -347,7 +348,7 @@ func (s *Store) ListTelegramInvoices(telegramID int64) ([]TelegramInvoice, error
 	for rows.Next() {
 		var inv TelegramInvoice
 		var created, expires, updated string
-		if e = rows.Scan(&inv.ID, &inv.TelegramID, &inv.Address, &inv.PriceWei, &inv.ChainID, &created, &expires, &inv.StartBlock, &inv.Status, &inv.TxHash, &updated); e != nil {
+		if e = rows.Scan(&inv.ID, &inv.TelegramID, &inv.PlanID, &inv.Address, &inv.PriceWei, &inv.ChainID, &created, &expires, &inv.StartBlock, &inv.Status, &inv.TxHash, &updated); e != nil {
 			return nil, e
 		}
 		inv.CreatedAt, _ = time.Parse(time.RFC3339, created)
@@ -367,7 +368,7 @@ func (s *Store) PageTelegramInvoices(telegramID int64, limit, offset int) ([]Tel
 	}
 	now := time.Now().UTC().Format(time.RFC3339)
 	_, _ = s.DB.Exec(`UPDATE telegram_invoices SET status='expired',updated_at=? WHERE telegram_id=? AND status='pending' AND expires_at<=?`, now, telegramID, now)
-	rows, e := s.DB.Query(`SELECT id,telegram_id,address,price_wei,chain_id,created_at,expires_at,start_block,status,tx_hash,updated_at FROM telegram_invoices WHERE telegram_id=? ORDER BY created_at DESC LIMIT ? OFFSET ?`, telegramID, limit, offset)
+	rows, e := s.DB.Query(`SELECT id,telegram_id,plan_id,address,price_wei,chain_id,created_at,expires_at,start_block,status,tx_hash,updated_at FROM telegram_invoices WHERE telegram_id=? ORDER BY created_at DESC LIMIT ? OFFSET ?`, telegramID, limit, offset)
 	if e != nil {
 		return nil, 0, e
 	}
@@ -376,7 +377,7 @@ func (s *Store) PageTelegramInvoices(telegramID int64, limit, offset int) ([]Tel
 	for rows.Next() {
 		var inv TelegramInvoice
 		var created, expires, updated string
-		if e = rows.Scan(&inv.ID, &inv.TelegramID, &inv.Address, &inv.PriceWei, &inv.ChainID, &created, &expires, &inv.StartBlock, &inv.Status, &inv.TxHash, &updated); e != nil {
+		if e = rows.Scan(&inv.ID, &inv.TelegramID, &inv.PlanID, &inv.Address, &inv.PriceWei, &inv.ChainID, &created, &expires, &inv.StartBlock, &inv.Status, &inv.TxHash, &updated); e != nil {
 			return nil, 0, e
 		}
 		inv.CreatedAt, _ = time.Parse(time.RFC3339, created)

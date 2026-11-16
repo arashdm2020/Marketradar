@@ -2,7 +2,6 @@ package webapp
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"math/big"
 	"strings"
@@ -14,6 +13,7 @@ import (
 type Invoice struct {
 	ID         string    `json:"id"`
 	UserID     int64     `json:"-"`
+	PlanID     string    `json:"plan_id"`
 	Address    string    `json:"address"`
 	PriceWei   string    `json:"price_wei"`
 	ChainID    uint64    `json:"chain_id"`
@@ -25,6 +25,7 @@ type Invoice struct {
 }
 type Billing struct {
 	Store                 *Store
+	Profile               *profile.Store
 	Deriver               *bnb.Deriver
 	Chain                 bnb.Chain
 	ExpectedChainID       uint64
@@ -36,7 +37,16 @@ type Billing struct {
 }
 
 func (b *Billing) Ready() bool {
-	return b != nil && b.Store != nil && b.Deriver != nil && b.Chain != nil && b.ExpectedChainID != 0 && b.Confirmations > 0 && b.ReferenceVerified
+	return b != nil && b.Store != nil && b.profileStore() != nil && b.Chain != nil && b.ExpectedChainID == 56 && b.Confirmations > 0
+}
+func (b *Billing) profileStore() *profile.Store {
+	if b == nil || b.Store == nil {
+		return nil
+	}
+	if b.Profile != nil {
+		return b.Profile
+	}
+	return &profile.Store{DB: b.Store.DB}
 }
 func (b *Billing) MonitorReady() bool {
 	return b != nil && b.Store != nil && b.Chain != nil && b.ExpectedChainID != 0 && b.Confirmations > 0
@@ -52,6 +62,18 @@ func (b *Billing) CreateInvoice(ctx context.Context, user int64, now time.Time) 
 	if !b.PublicInvoicesEnabled && (!b.TestInvoicesEnabled || b.TestEmail == "" || normalizeEmail(email) != normalizeEmail(b.TestEmail)) {
 		return Invoice{}, errors.New("public invoicing disabled")
 	}
+	profiles := b.profileStore()
+	telegramID, e := profiles.TelegramForWebUser(user)
+	if e != nil {
+		return Invoice{}, errors.New("verified Telegram account required")
+	}
+	wallet, e := profiles.WalletRecordForTelegram(telegramID)
+	if e != nil {
+		return Invoice{}, errors.New("Telegram wallet unavailable")
+	}
+	if !wallet.Signable {
+		return Invoice{}, errors.New("wallet is not eligible for checkout")
+	}
 	price, e := b.Store.Price()
 	if e != nil {
 		return Invoice{}, e
@@ -60,68 +82,34 @@ func (b *Billing) CreateInvoice(ctx context.Context, user int64, now time.Time) 
 	if e != nil {
 		return Invoice{}, e
 	}
-	if chainID != b.ExpectedChainID {
+	if chainID != 56 || chainID != b.ExpectedChainID {
 		return Invoice{}, errors.New("wrong BNB network")
 	}
 	head, e := b.Chain.Head(ctx)
 	if e != nil {
 		return Invoice{}, e
 	}
-	tx, e := b.Store.DB.BeginTx(ctx, nil)
+	shared, e := profiles.CreateTelegramInvoice(telegramID, wallet.Address, price.String(), chainID, now.UTC().Add(15*time.Minute), head+1)
 	if e != nil {
 		return Invoice{}, e
 	}
-	defer tx.Rollback()
-	_, e = tx.ExecContext(ctx, `UPDATE web_invoices SET status='expired' WHERE user_id=? AND status='pending' AND expires_at<=?`, user, now.UTC().Format(time.RFC3339))
-	if e != nil {
-		return Invoice{}, e
+	return Invoice{ID: shared.ID, UserID: user, PlanID: shared.PlanID, Address: shared.Address, PriceWei: shared.PriceWei, ChainID: shared.ChainID, CreatedAt: shared.CreatedAt, ExpiresAt: shared.ExpiresAt, StartBlock: shared.StartBlock, Status: shared.Status, TxHash: shared.TxHash}, nil
+}
+
+func (b *Billing) InvoiceForWebUser(user int64, id string) (Invoice, error) {
+	profiles := b.profileStore()
+	if profiles == nil {
+		return Invoice{}, errors.New("billing profile unavailable")
 	}
-	var inv Invoice
-	var created, expires string
-	e = tx.QueryRowContext(ctx, `SELECT id,user_id,address,price_wei,chain_id,created_at,expires_at,start_block,status,tx_hash FROM web_invoices WHERE user_id=? AND status='pending'`, user).Scan(&inv.ID, &inv.UserID, &inv.Address, &inv.PriceWei, &inv.ChainID, &created, &expires, &inv.StartBlock, &inv.Status, &inv.TxHash)
-	if e == nil {
-		inv.CreatedAt, _ = time.Parse(time.RFC3339, created)
-		inv.ExpiresAt, _ = time.Parse(time.RFC3339, expires)
-		return inv, tx.Commit()
+	telegramID, err := profiles.TelegramForWebUser(user)
+	if err != nil {
+		return Invoice{}, err
 	}
-	if e != sql.ErrNoRows {
-		return Invoice{}, e
+	shared, err := profiles.TelegramInvoice(telegramID, id)
+	if err != nil {
+		return Invoice{}, err
 	}
-	var index uint32
-	var address string
-	e = tx.QueryRowContext(ctx, `SELECT derivation_index,address FROM web_wallets WHERE user_id=?`, user).Scan(&index, &address)
-	if e == sql.ErrNoRows {
-		var next int64
-		if e = tx.QueryRowContext(ctx, `SELECT next_index FROM wallet_sequence WHERE id=1`).Scan(&next); e != nil {
-			return Invoice{}, e
-		}
-		if next < 0 || next >= 1<<31 {
-			return Invoice{}, errors.New("wallet index exhausted")
-		}
-		index = uint32(next)
-		address, e = b.Deriver.Address(index)
-		if e != nil {
-			return Invoice{}, e
-		}
-		if _, e = tx.ExecContext(ctx, `UPDATE wallet_sequence SET next_index=next_index+1 WHERE id=1`); e != nil {
-			return Invoice{}, e
-		}
-		if _, e = tx.ExecContext(ctx, `INSERT INTO web_wallets(user_id,derivation_index,address) VALUES(?,?,?)`, user, index, address); e != nil {
-			return Invoice{}, e
-		}
-	} else if e != nil {
-		return Invoice{}, e
-	}
-	id := profile.NewID()
-	if id == "" {
-		return Invoice{}, errors.New("random unavailable")
-	}
-	inv = Invoice{ID: id, UserID: user, Address: address, PriceWei: price.String(), ChainID: chainID, CreatedAt: now.UTC(), ExpiresAt: now.UTC().Add(15 * time.Minute), StartBlock: head + 1, Status: "pending"}
-	_, e = tx.ExecContext(ctx, `INSERT INTO web_invoices(id,user_id,address,price_wei,chain_id,created_at,expires_at,start_block,status) VALUES(?,?,?,?,?,?,?,?,?)`, inv.ID, user, address, inv.PriceWei, chainID, inv.CreatedAt.Format(time.RFC3339), inv.ExpiresAt.Format(time.RFC3339), inv.StartBlock, inv.Status)
-	if e != nil {
-		return Invoice{}, e
-	}
-	return inv, tx.Commit()
+	return Invoice{ID: shared.ID, UserID: user, PlanID: shared.PlanID, Address: shared.Address, PriceWei: shared.PriceWei, ChainID: shared.ChainID, CreatedAt: shared.CreatedAt, ExpiresAt: shared.ExpiresAt, StartBlock: shared.StartBlock, Status: shared.Status, TxHash: shared.TxHash}, nil
 }
 func (s *Store) Invoice(user int64, id string) (Invoice, error) {
 	var v Invoice
