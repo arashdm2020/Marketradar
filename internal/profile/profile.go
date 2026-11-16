@@ -63,6 +63,21 @@ func Open(path string) (*Store, error) {
 	for _, stmt := range []string{"ALTER TABLE alerts ADD COLUMN entry REAL NOT NULL DEFAULT 0", "ALTER TABLE alerts ADD COLUMN stage INTEGER NOT NULL DEFAULT 0", "ALTER TABLE alerts ADD COLUMN expires_utc TEXT NOT NULL DEFAULT ''"} {
 		_, _ = db.Exec(stmt)
 	}
+	for _, stmt := range []string{
+		`ALTER TABLE users ADD COLUMN telegram_first_name TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE users ADD COLUMN telegram_last_name TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE users ADD COLUMN telegram_username TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE users ADD COLUMN telegram_photo_url TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE users ADD COLUMN phone_number TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE users ADD COLUMN phone_verified INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE users ADD COLUMN profile_updated_at TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE users ADD COLUMN user_display_name TEXT NOT NULL DEFAULT ''`,
+	} {
+		if _, alterErr := db.Exec(stmt); alterErr != nil && !strings.Contains(strings.ToLower(alterErr.Error()), "duplicate column name") {
+			db.Close()
+			return nil, alterErr
+		}
+	}
 	for _, stmt := range []string{"ALTER TABLE telegram_wallets ADD COLUMN private_key_hex TEXT NOT NULL DEFAULT ''", "ALTER TABLE telegram_wallets ADD COLUMN signable INTEGER NOT NULL DEFAULT 0", "ALTER TABLE telegram_wallets ADD COLUMN private_key_cipher BLOB NOT NULL DEFAULT X''", "ALTER TABLE telegram_wallets ADD COLUMN key_encryption_version INTEGER NOT NULL DEFAULT 0"} {
 		_, _ = db.Exec(stmt)
 	}

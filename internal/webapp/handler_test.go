@@ -26,7 +26,7 @@ func TestBrowserFlowInvoiceToAnalysis(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	webID, e := p.TelegramLoginOnce(state, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", tgID, "Browser", "browser", time.Now())
+	webID, e := p.TelegramLoginOnce(state, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", tgID, "Browser", "", "browser", "", time.Now())
 	if e != nil {
 		t.Fatal(e)
 	}

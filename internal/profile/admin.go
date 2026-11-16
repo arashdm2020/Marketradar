@@ -10,6 +10,14 @@ const AdminID int64 = 8697362188
 
 type AdminUser struct {
 	ID                 int64  `json:"id"`
+	FirstName          string `json:"first_name"`
+	LastName           string `json:"last_name"`
+	DisplayName        string `json:"display_name"`
+	ProvidedName       string `json:"provided_display_name"`
+	Username           string `json:"username"`
+	PhoneNumber        string `json:"phone_number"`
+	PhoneVerified      bool   `json:"phone_verified"`
+	PhotoURL           string `json:"photo_url"`
 	Plan               string `json:"plan"`
 	SubscriptionUntil  string `json:"subscription_until"`
 	SubscriptionActive bool   `json:"subscription_active"`
@@ -49,6 +57,13 @@ func (s *Store) AdminUsers(admin int64) ([]AdminUser, error) {
 			return nil, accessErr
 		}
 		u := AdminUser{ID: id, Plan: string(a.Policy.ID), SubscriptionUntil: a.SubscriptionUntil, SubscriptionActive: a.SubscriptionActive, Exempt: a.Exempt, DailyAllowance: a.Allowance, DailyUsed: a.Used, DailyRemaining: a.Remaining, LegacyUnlimited: a.LegacyUnlimited}
+		p, profileErr := s.TelegramProfile(id)
+		if profileErr != nil {
+			return nil, profileErr
+		}
+		u.FirstName, u.LastName, u.DisplayName = p.FirstName, p.LastName, p.DisplayName()
+		u.ProvidedName = p.ProvidedName
+		u.Username, u.PhoneNumber, u.PhoneVerified, u.PhotoURL = p.Username, p.PhoneNumber, p.PhoneVerified, p.PhotoURL
 		u.FreeUsedToday = a.Policy.ID == "visitor" && a.Used > 0
 		if a.Policy.ID == "visitor" {
 			u.FreeRemaining = a.Remaining

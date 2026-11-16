@@ -79,6 +79,7 @@ func (h *Handler) Routes() http.Handler {
 	m.HandleFunc("/app/logout", h.logout)
 	m.HandleFunc("/app/api/logout", h.logoutAPI)
 	m.HandleFunc("/app/api/me", h.me)
+	m.HandleFunc("/app/api/profile", h.updateProfile)
 	m.HandleFunc("/app/api/telegram/nonce", h.telegramNonce)
 	m.HandleFunc("/app/api/telegram/callback", h.telegramCallback)
 	m.HandleFunc("/app/api/invoice", h.invoice)
@@ -120,7 +121,7 @@ func (h *Handler) telegramCallback(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Telegram authentication failed", 401)
 		return
 	}
-	webID, e := h.Profile.TelegramLoginOnce(payload.Nonce, payload.Hash, payload.ID, payload.FirstName, payload.Username, time.Now())
+	webID, e := h.Profile.TelegramLoginOnce(payload.Nonce, payload.Hash, payload.ID, payload.FirstName, payload.LastName, payload.Username, payload.PhotoURL, time.Now())
 	if e != nil {
 		http.Error(w, "Telegram login expired or already used", 401)
 		return
@@ -268,8 +269,8 @@ func (h *Handler) me(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "access status unavailable", 500)
 		return
 	}
-	var firstName, username string
-	if e = h.Store.DB.QueryRow(`SELECT first_name,username FROM web_users WHERE id=?`, id).Scan(&firstName, &username); e != nil {
+	telegramProfile, e := h.Profile.TelegramProfile(tgID)
+	if e != nil {
 		http.Error(w, "profile unavailable", 500)
 		return
 	}
@@ -306,7 +307,12 @@ func (h *Handler) me(w http.ResponseWriter, r *http.Request) {
 		invoiceAvailable = h.Store.DB.QueryRow(`SELECT email FROM web_users WHERE id=?`, id).Scan(&email) == nil && normalizeEmail(email) == normalizeEmail(h.Billing.TestEmail)
 	}
 	v := map[string]any{
-		"profile":       map[string]any{"telegram_id": tgID, "first_name": firstName, "username": username},
+		"profile": map[string]any{
+			"telegram_id": tgID, "first_name": telegramProfile.FirstName, "last_name": telegramProfile.LastName,
+			"display_name": telegramProfile.DisplayName(), "provided_display_name": telegramProfile.ProvidedName, "username": telegramProfile.Username,
+			"phone_number": telegramProfile.PhoneNumber, "phone_verified": telegramProfile.PhoneVerified,
+			"photo_url": telegramProfile.PhotoURL,
+		},
 		"subscription":  map[string]any{"plan": access.Policy.Label, "active": access.SubscriptionActive, "until": access.SubscriptionUntil},
 		"quota":         map[string]any{"daily_allowance": access.Allowance, "used": access.Used, "remaining": access.Remaining, "exempt": access.Exempt},
 		"wallet":        map[string]any{"address": address, "network": network, "chain_id": chainID, "balance_bnb": balance},
@@ -316,6 +322,52 @@ func (h *Handler) me(w http.ResponseWriter, r *http.Request) {
 		v["price_wei"] = price.String()
 	}
 	out(w, v)
+}
+
+type updateProfilePayload struct {
+	PhoneNumber string `json:"phone_number"`
+	DisplayName string `json:"display_name"`
+	Consent     bool   `json:"consent"`
+	ClearPhone  bool   `json:"clear_phone"`
+	ClearName   bool   `json:"clear_display_name"`
+}
+
+// updateProfile only resolves the Telegram identity from the authenticated web
+// session. A client cannot nominate another Telegram user ID.
+func (h *Handler) updateProfile(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	if !sameOrigin(w, r) {
+		return
+	}
+	webID, ok := h.require(w, r)
+	if !ok {
+		return
+	}
+	if h.Profile == nil {
+		http.Error(w, "profile unavailable", 503)
+		return
+	}
+	telegramID, err := h.Profile.TelegramForWebUser(webID)
+	if err != nil {
+		http.Error(w, "Telegram account not linked", 403)
+		return
+	}
+	var payload updateProfilePayload
+	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<10)).Decode(&payload) != nil {
+		http.Error(w, "invalid profile update", 400)
+		return
+	}
+	err = h.Profile.UpdateUserProvidedProfile(telegramID, payload.DisplayName, payload.PhoneNumber, payload.Consent, payload.ClearName, payload.ClearPhone)
+	if err != nil {
+		http.Error(w, "phone number was not saved; explicit consent and international format are required", 400)
+		return
+	}
+	profile, err := h.Profile.TelegramProfile(telegramID)
+	if err != nil {
+		http.Error(w, "profile unavailable", 500)
+		return
+	}
+	out(w, map[string]any{"ok": true, "phone_number": profile.PhoneNumber, "phone_verified": profile.PhoneVerified, "display_name": profile.DisplayName(), "provided_display_name": profile.ProvidedName})
 }
 
 func formatBNB(wei *big.Int) string {

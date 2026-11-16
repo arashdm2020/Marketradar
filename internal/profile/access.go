@@ -318,10 +318,14 @@ func (s *Store) ConsumeWebLink(token string, webUser int64, now time.Time) error
 // TelegramLoginOnce atomically consumes both the browser state nonce and the
 // signed Telegram assertion. The caller must verify Telegram's HMAC first.
 // Identity and wallet records remain Telegram-owned.
-func (s *Store) TelegramLoginOnce(nonce, authHash string, telegramID int64, firstName, username string, now time.Time) (int64, error) {
+func (s *Store) TelegramLoginOnce(nonce, authHash string, telegramID int64, firstName, lastName, username, photoURL string, now time.Time) (int64, error) {
 	if len(nonce) < 32 || len(authHash) < 32 || telegramID <= 0 {
 		return 0, errors.New("invalid Telegram login")
 	}
+	firstName = boundedProfileField(firstName, 256)
+	lastName = boundedProfileField(lastName, 256)
+	username = strings.TrimPrefix(boundedProfileField(username, 64), "@")
+	photoURL = safeTelegramPhotoURL(photoURL)
 	h := sha256.Sum256([]byte(nonce))
 	hash := hex.EncodeToString(h[:])
 	authDigest := sha256.Sum256([]byte(authHash))
@@ -397,7 +401,10 @@ func (s *Store) TelegramLoginOnce(nonce, authHash string, telegramID int64, firs
 	if e = tx.QueryRow(`SELECT telegram_id FROM web_telegram_links WHERE web_user_id=?`, id).Scan(&mappedTelegram); e != nil || mappedTelegram != telegramID {
 		return 0, errors.New("web identity is already linked to another Telegram account")
 	}
-	updated, e := tx.Exec(`UPDATE web_users SET telegram_id=?,first_name=?,username=? WHERE id=? AND (telegram_id IS NULL OR telegram_id=?)`, telegramID, firstName, username, id, telegramID)
+	if e = s.telegramProfileTx(tx, telegramID, firstName, lastName, username, photoURL, now); e != nil {
+		return 0, e
+	}
+	updated, e := tx.Exec(`UPDATE web_users SET telegram_id=?,first_name=CASE WHEN ?<>'' THEN ? ELSE first_name END,username=CASE WHEN ?<>'' THEN ? ELSE username END WHERE id=? AND (telegram_id IS NULL OR telegram_id=?)`, telegramID, strings.TrimSpace(firstName), strings.TrimSpace(firstName), strings.TrimPrefix(strings.TrimSpace(username), "@"), strings.TrimPrefix(strings.TrimSpace(username), "@"), id, telegramID)
 	if e != nil {
 		return 0, e
 	}

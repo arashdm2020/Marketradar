@@ -23,6 +23,9 @@ func TestAdminAuthenticationAndLookup(t *testing.T) {
 	}
 	defer store.DB.Close()
 	_, _ = store.Ensure(22)
+	if _, e = store.DB.Exec(`UPDATE users SET telegram_first_name='Ada',telegram_last_name='Lovelace',telegram_username='ada',phone_number='+14155552671',phone_verified=0 WHERE id=22`); e != nil {
+		t.Fatal(e)
+	}
 	_ = store.CreateRequestState("track-22", "22", "22", "AUD/USD", "30min", "day")
 	s := New(store, "test-token", "bot")
 	h := s.Handler()
@@ -101,6 +104,20 @@ func TestAdminAuthenticationAndLookup(t *testing.T) {
 	users, e := store.AdminUsers(profile.AdminID)
 	if e != nil || len(users) != 1 || !users[0].Exempt {
 		t.Fatalf("exemption was not persisted: %+v %v", users, e)
+	}
+	unauthUsers := httptest.NewRecorder()
+	h.ServeHTTP(unauthUsers, httptest.NewRequest("GET", "/api/operations/users", nil))
+	if unauthUsers.Code != http.StatusForbidden {
+		t.Fatalf("admin profile endpoint status=%d", unauthUsers.Code)
+	}
+	authUsersReq := httptest.NewRequest("GET", "/api/operations/users", nil)
+	authUsersReq.AddCookie(cookie)
+	authUsers := httptest.NewRecorder()
+	h.ServeHTTP(authUsers, authUsersReq)
+	for _, field := range []string{`"display_name":"Ada Lovelace"`, `"username":"ada"`, `"phone_number":"+14155552671"`, `"phone_verified":false`} {
+		if authUsers.Code != 200 || !strings.Contains(authUsers.Body.String(), field) {
+			t.Fatalf("admin user profile missing %s: %d %s", field, authUsers.Code, authUsers.Body.String())
+		}
 	}
 	webStore, e := webapp.NewStore(store.DB)
 	if e != nil {

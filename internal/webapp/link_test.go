@@ -139,7 +139,7 @@ func TestWebLinkRequiresLoginAndConfirmation(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	webID, e := p.TelegramLoginOnce(state, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", telegramID, "Confirm", "confirm", time.Now())
+	webID, e := p.TelegramLoginOnce(state, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", telegramID, "Confirm", "", "confirm", "", time.Now())
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -198,7 +198,7 @@ func TestUserPanelShowsInvoiceFieldsAndDisabledBilling(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	webID, e := p.TelegramLoginOnce(state, "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210", telegramID, "Panel", "panel", time.Now())
+	webID, e := p.TelegramLoginOnce(state, "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210", telegramID, "Panel", "", "panel", "", time.Now())
 	if e != nil {
 		t.Fatal(e)
 	}

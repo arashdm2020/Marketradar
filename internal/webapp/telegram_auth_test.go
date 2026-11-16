@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"io"
+	"net/http"
 	"net/http/httptest"
 	"sort"
 	"strconv"
@@ -18,7 +19,16 @@ import (
 
 func signedTelegramPayload(token string, id int64, first, username string, at time.Time) telegramLoginPayload {
 	v := telegramLoginPayload{ID: id, FirstName: first, Username: username, AuthDate: at.Unix(), Nonce: "browser-state-nonce-at-least-32-characters"}
-	values := map[string]string{"id": strconv.FormatInt(id, 10), "first_name": first, "auth_date": strconv.FormatInt(at.Unix(), 10), "username": username}
+	return signTelegramPayload(token, v)
+}
+
+func signTelegramPayload(token string, v telegramLoginPayload) telegramLoginPayload {
+	values := map[string]string{"id": strconv.FormatInt(v.ID, 10), "first_name": v.FirstName, "auth_date": strconv.FormatInt(v.AuthDate, 10)}
+	for key, value := range map[string]string{"last_name": v.LastName, "username": v.Username, "photo_url": v.PhotoURL, "allows_write_to_pm": v.AllowsWriteToPM} {
+		if value != "" {
+			values[key] = value
+		}
+	}
 	keys := make([]string, 0, len(values))
 	for k := range values {
 		keys = append(keys, k)
@@ -108,6 +118,9 @@ func TestTelegramCallbackCreatesSecureSessionAndReplaysFail(t *testing.T) {
 	}
 	h := (&Handler{Store: w, Profile: p, Billing: &Billing{Chain: &fakeChain{chainID: 56}, ExpectedChainID: 56}}).Routes()
 	login := signedTelegramPayload("test-bot-token", tg, "Test User", "testuser", time.Now())
+	login.LastName = "Profile"
+	login.PhotoURL = "https://t.me/i/userpic/test.jpg"
+	login = signTelegramPayload("test-bot-token", login)
 	login.Nonce = nonce
 	body, _ := json.Marshal(login)
 	call := func() *httptest.ResponseRecorder {
@@ -134,8 +147,55 @@ func TestTelegramCallbackCreatesSecureSessionAndReplaysFail(t *testing.T) {
 	me.AddCookie(cookie)
 	out := httptest.NewRecorder()
 	h.ServeHTTP(out, me)
-	if out.Code != 200 || !strings.Contains(out.Body.String(), `"telegram_id":891122`) || !strings.Contains(out.Body.String(), `"daily_allowance":1`) || !strings.Contains(out.Body.String(), walletAddress) || !strings.Contains(out.Body.String(), `"balance_bnb":"0"`) || strings.Contains(out.Body.String(), "private_key") {
+	if out.Code != 200 || !strings.Contains(out.Body.String(), `"telegram_id":891122`) || !strings.Contains(out.Body.String(), `"last_name":"Profile"`) || !strings.Contains(out.Body.String(), `"username":"testuser"`) || !strings.Contains(out.Body.String(), `"photo_url":"https://t.me/i/userpic/test.jpg"`) || !strings.Contains(out.Body.String(), `"daily_allowance":1`) || !strings.Contains(out.Body.String(), walletAddress) || !strings.Contains(out.Body.String(), `"balance_bnb":"0"`) || strings.Contains(out.Body.String(), "private_key") {
 		t.Fatalf("account response status=%d body=%s", out.Code, out.Body.String())
+	}
+	updateBody := `{"phone_number":"+1 (415) 555-2671","display_name":"Personal Name","consent":true,"telegram_id":999999}`
+	update := httptest.NewRequest("POST", "/app/api/profile", strings.NewReader(updateBody))
+	update.Header.Set("Origin", "http://example.test")
+	update.Header.Set("Content-Type", "application/json")
+	update.Host = "example.test"
+	update.AddCookie(cookie)
+	updateResult := httptest.NewRecorder()
+	h.ServeHTTP(updateResult, update)
+	stored, profileErr := p.TelegramProfile(tg)
+	if updateResult.Code != 200 || profileErr != nil || stored.PhoneNumber != "+14155552671" || stored.PhoneVerified || stored.ProvidedName != "Personal Name" {
+		t.Fatalf("owner phone update status=%d profile=%+v err=%v", updateResult.Code, stored, profileErr)
+	}
+	otherTelegramID := int64(891123)
+	if _, err = p.Ensure(otherTelegramID); err != nil {
+		t.Fatal(err)
+	}
+	otherNonce, err := p.IssueTelegramLoginNonce(time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherWebID, err := p.TelegramLoginOnce(otherNonce, strings.Repeat("9", 64), otherTelegramID, "Other", "", "", "", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherSession, err := w.CreateSessionForUser(otherWebID, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherUpdate := httptest.NewRequest("POST", "/app/api/profile", strings.NewReader(`{"phone_number":"+44 20 7946 0958","consent":true,"telegram_id":891122}`))
+	otherUpdate.Header.Set("Origin", "http://example.test")
+	otherUpdate.Host = "example.test"
+	otherUpdate.AddCookie(&http.Cookie{Name: "mr_web", Value: otherSession})
+	otherResult := httptest.NewRecorder()
+	h.ServeHTTP(otherResult, otherUpdate)
+	ownerAfter, _ := p.TelegramProfile(tg)
+	otherAfter, _ := p.TelegramProfile(otherTelegramID)
+	if otherResult.Code != 200 || ownerAfter.PhoneNumber != "+14155552671" || otherAfter.PhoneNumber != "+442079460958" {
+		t.Fatalf("client-selected identity was trusted: status=%d owner=%+v other=%+v", otherResult.Code, ownerAfter, otherAfter)
+	}
+	unauthorized := httptest.NewRequest("POST", "/app/api/profile", strings.NewReader(updateBody))
+	unauthorized.Header.Set("Origin", "http://example.test")
+	unauthorized.Host = "example.test"
+	unauthorizedResult := httptest.NewRecorder()
+	h.ServeHTTP(unauthorizedResult, unauthorized)
+	if unauthorizedResult.Code != 401 {
+		t.Fatalf("unauthenticated profile update status=%d", unauthorizedResult.Code)
 	}
 	var walletCount int
 	if err = p.DB.QueryRow(`SELECT count(*) FROM telegram_wallets WHERE telegram_id=?`, tg).Scan(&walletCount); err != nil || walletCount != 1 {

@@ -31,7 +31,7 @@ func TestTelegramLoginMapsOnlyExistingIdentityOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	id, err := s.TelegramLoginOnce(nonce, assertion, tg, "Test", "tester", now)
+	id, err := s.TelegramLoginOnce(nonce, assertion, tg, "Test", "", "tester", "", now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -39,14 +39,14 @@ func TestTelegramLoginMapsOnlyExistingIdentityOnce(t *testing.T) {
 	if err = s.DB.QueryRow(`SELECT web_user_id FROM web_telegram_links WHERE telegram_id=?`, tg).Scan(&linked); err != nil || linked != id {
 		t.Fatalf("linked=%d id=%d err=%v", linked, id, err)
 	}
-	if _, err = s.TelegramLoginOnce(nonce, assertion, tg, "Test", "tester", now); err == nil {
+	if _, err = s.TelegramLoginOnce(nonce, assertion, tg, "Test", "", "tester", "", now); err == nil {
 		t.Fatal("replay accepted")
 	}
 	secondNonce, err := s.IssueTelegramLoginNonce(now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = s.TelegramLoginOnce(secondNonce, assertion, tg, "Test", "tester", now); err == nil {
+	if _, err = s.TelegramLoginOnce(secondNonce, assertion, tg, "Test", "", "tester", "", now); err == nil {
 		t.Fatal("same signed Telegram assertion replayed with fresh state")
 	}
 	var n int
@@ -57,7 +57,7 @@ func TestTelegramLoginMapsOnlyExistingIdentityOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	secondID, err := s.TelegramLoginOnce(secondState, "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789", tg, "Test", "tester", now)
+	secondID, err := s.TelegramLoginOnce(secondState, "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789", tg, "Test", "", "tester", "", now)
 	if err != nil || secondID != id {
 		t.Fatalf("Telegram identity was not reused: id=%d want=%d err=%v", secondID, id, err)
 	}
@@ -69,7 +69,7 @@ func TestTelegramLoginRejectsUnknownTelegramIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.TelegramLoginOnce(nonce, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", 998877, "Unknown", "", time.Now()); err == nil {
+	if _, err := s.TelegramLoginOnce(nonce, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", 998877, "Unknown", "", "", "", time.Now()); err == nil {
 		t.Fatal("unknown Telegram identity accepted")
 	}
 }
@@ -85,7 +85,7 @@ func TestTelegramLoginStateExpiresAndDoesNotConsumeQuotaOrWallet(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = s.TelegramLoginOnce(nonce, "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789", tg, "Test", "", now.Add(6*time.Minute)); err == nil {
+	if _, err = s.TelegramLoginOnce(nonce, "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789", tg, "Test", "", "", "", now.Add(6*time.Minute)); err == nil {
 		t.Fatal("expired login state accepted")
 	}
 	var uses, wallets, webUsers int
@@ -115,7 +115,7 @@ func TestTelegramLoginConcurrentReplayHasOneWinner(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if _, err := s.TelegramLoginOnce(nonce, assertion, tg, "Test", "", time.Now()); err == nil {
+			if _, err := s.TelegramLoginOnce(nonce, assertion, tg, "Test", "", "", "", time.Now()); err == nil {
 				mu.Lock()
 				wins++
 				mu.Unlock()
