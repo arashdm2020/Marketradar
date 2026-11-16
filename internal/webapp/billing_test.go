@@ -178,6 +178,10 @@ func TestTelegramInvoiceSettlementIsIdempotent(t *testing.T) {
 	if first != second {
 		t.Fatal("duplicate transaction extended subscription twice")
 	}
+	var notifications int
+	if e = p.DB.QueryRow(`SELECT count(*) FROM payment_notification_outbox WHERE invoice_id=?`, invoice.ID).Scan(&notifications); e != nil || notifications != 2 {
+		t.Fatalf("notifications=%d err=%v", notifications, e)
+	}
 }
 
 type fakeAnalyzer struct{}
@@ -318,7 +322,7 @@ func TestConcurrentInvoiceOneAddressAndManualReview(t *testing.T) {
 	for _, v := range review {
 		classes[v.Classification] = true
 	}
-	if !classes["amount_mismatch"] || !classes["late_or_outside_window"] {
+	if !classes["underpayment"] || !classes["late_payment"] {
 		t.Fatalf("review classes: %+v", classes)
 	}
 }

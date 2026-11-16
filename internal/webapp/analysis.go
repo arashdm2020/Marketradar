@@ -52,10 +52,8 @@ func (s *AnalysisService) Submit(user int64, symbol, frame, style string) (strin
 	if e != nil {
 		return "", e
 	}
-	switch style {
-	case "scalp", "day", "swing", "position":
-	default:
-		return "", errors.New("unsupported style")
+	if e = catalog.ValidateCombination(tf, style); e != nil {
+		return "", e
 	}
 	cfg, e := s.Config.ActiveConfig()
 	if e != nil {

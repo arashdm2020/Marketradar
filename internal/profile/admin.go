@@ -10,53 +10,52 @@ const AdminID int64 = 8697362188
 
 type AdminUser struct {
 	ID                 int64  `json:"id"`
+	Plan               string `json:"plan"`
 	SubscriptionUntil  string `json:"subscription_until"`
 	SubscriptionActive bool   `json:"subscription_active"`
 	Exempt             bool   `json:"exempt"`
 	FreeUsedToday      bool   `json:"free_used_today"`
 	FreeRemaining      int    `json:"free_remaining"`
+	DailyAllowance     int    `json:"daily_allowance"`
+	DailyUsed          int    `json:"daily_used"`
+	DailyRemaining     int    `json:"daily_remaining"`
+	LegacyUnlimited    bool   `json:"legacy_unlimited"`
 }
 
 func (s *Store) AdminUsers(admin int64) ([]AdminUser, error) {
 	if admin != AdminID {
 		return nil, errors.New("forbidden")
 	}
-	loc, _ := time.LoadLocation("Asia/Tehran")
-	day := time.Now().In(loc).Format("2006-01-02")
-	var webReady int
-	if e := s.DB.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='table' AND name='web_users'`).Scan(&webReady); e != nil {
-		return nil, e
-	}
-	query := `SELECT u.id,COALESCE(e.subscription_until,''),COALESCE(e.exempt,0),EXISTS(SELECT 1 FROM daily_uses d WHERE d.user_id=u.id AND d.day_tehran=? AND d.access_kind='free' AND d.status IN ('reserved','consumed','uncertain')) FROM users u LEFT JOIN entitlements e ON e.user_id=u.id ORDER BY u.id`
-	if webReady != 0 {
-		query = `SELECT u.id,COALESCE(NULLIF(w.subscription_until,''),e.subscription_until,''),COALESCE(e.exempt,0),EXISTS(SELECT 1 FROM daily_uses d WHERE d.user_id=u.id AND d.day_tehran=? AND d.access_kind='free' AND d.status IN ('reserved','consumed','uncertain')) FROM users u LEFT JOIN entitlements e ON e.user_id=u.id LEFT JOIN web_telegram_links l ON l.telegram_id=u.id LEFT JOIN web_users w ON w.id=l.web_user_id ORDER BY u.id`
-	}
-	rows, e := s.DB.Query(query, day)
+	rows, e := s.DB.Query(`SELECT id FROM users ORDER BY id`)
 	if e != nil {
 		return nil, e
 	}
-	defer rows.Close()
-	var out []AdminUser
+	var ids []int64
 	for rows.Next() {
-		var u AdminUser
-		var ex, used int
-		if e = rows.Scan(&u.ID, &u.SubscriptionUntil, &ex, &used); e != nil {
+		var id int64
+		if e = rows.Scan(&id); e != nil {
+			rows.Close()
 			return nil, e
 		}
-		u.Exempt = ex == 1
-		if u.ID == AdminID {
-			u.Exempt = true
+		ids = append(ids, id)
+	}
+	if e = rows.Close(); e != nil {
+		return nil, e
+	}
+	out := make([]AdminUser, 0, len(ids))
+	for _, id := range ids {
+		a, accessErr := s.Access(id, time.Now())
+		if accessErr != nil {
+			return nil, accessErr
 		}
-		u.FreeUsedToday = used == 1
-		if t, e := time.Parse(time.RFC3339, u.SubscriptionUntil); e == nil {
-			u.SubscriptionActive = t.After(time.Now())
-		}
-		if !u.FreeUsedToday {
-			u.FreeRemaining = 1
+		u := AdminUser{ID: id, Plan: string(a.Policy.ID), SubscriptionUntil: a.SubscriptionUntil, SubscriptionActive: a.SubscriptionActive, Exempt: a.Exempt, DailyAllowance: a.Allowance, DailyUsed: a.Used, DailyRemaining: a.Remaining, LegacyUnlimited: a.LegacyUnlimited}
+		u.FreeUsedToday = a.Policy.ID == "visitor" && a.Used > 0
+		if a.Policy.ID == "visitor" {
+			u.FreeRemaining = a.Remaining
 		}
 		out = append(out, u)
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 type AdminAnalysis struct {

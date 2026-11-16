@@ -37,7 +37,73 @@ func NewStore(db *sql.DB) (*Store, error) {
 	if e == nil {
 		_, e = db.Exec(`CREATE TABLE IF NOT EXISTS treasury_destinations(version INTEGER PRIMARY KEY AUTOINCREMENT,address TEXT NOT NULL,active INTEGER NOT NULL DEFAULT 0,admin_id INTEGER NOT NULL,at_utc TEXT NOT NULL);CREATE UNIQUE INDEX IF NOT EXISTS treasury_one_active ON treasury_destinations(active) WHERE active=1;CREATE TABLE IF NOT EXISTS treasury_jobs(payment_hash TEXT PRIMARY KEY REFERENCES web_payment_events(tx_hash),source TEXT NOT NULL,amount_wei TEXT NOT NULL,destination_version INTEGER NOT NULL DEFAULT 0,status TEXT NOT NULL,nonce INTEGER,tx_hash TEXT NOT NULL DEFAULT '',raw_tx TEXT NOT NULL DEFAULT '',fee_wei TEXT NOT NULL DEFAULT '',updated_at TEXT NOT NULL);CREATE UNIQUE INDEX IF NOT EXISTS treasury_source_nonce ON treasury_jobs(source,nonce) WHERE nonce IS NOT NULL`)
 	}
+	if e == nil {
+		var migrated int
+		e = db.QueryRow(`SELECT count(*) FROM schema_version WHERE version=4`).Scan(&migrated)
+		if e == nil && migrated == 0 {
+			tx, txErr := db.Begin()
+			if txErr != nil {
+				e = txErr
+			} else {
+				defer tx.Rollback()
+				for _, q := range []string{
+					`ALTER TABLE web_users ADD COLUMN plan_id TEXT NOT NULL DEFAULT 'visitor'`,
+					`ALTER TABLE web_users ADD COLUMN daily_allowance_override INTEGER NOT NULL DEFAULT 0`,
+					`ALTER TABLE web_invoices ADD COLUMN plan_id TEXT NOT NULL DEFAULT 'standard'`,
+				} {
+					if _, txErr = tx.Exec(q); txErr != nil && !strings.Contains(strings.ToLower(txErr.Error()), "duplicate column name") {
+						e = txErr
+						break
+					}
+				}
+				if e == nil {
+					_, e = tx.Exec(`UPDATE web_users SET plan_id='standard',daily_allowance_override=-1 WHERE subscription_until!='' AND (plan_id='' OR plan_id='visitor' OR lower(plan_id)='public')`)
+				}
+				if e == nil {
+					_, e = tx.Exec(`INSERT OR IGNORE INTO schema_version(version) VALUES(4)`)
+				}
+				if e == nil {
+					e = tx.Commit()
+				}
+			}
+		}
+	}
+	if e == nil {
+		e = s.migrateFinancialCore()
+	}
 	return s, e
+}
+
+func (s *Store) migrateFinancialCore() error {
+	var done int
+	if err := s.DB.QueryRow(`SELECT count(*) FROM schema_version WHERE version=6`).Scan(&done); err != nil || done == 1 {
+		return err
+	}
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, q := range []string{
+		`ALTER TABLE web_invoices ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE web_payment_events ADD COLUMN user_id INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE web_payment_events ADD COLUMN channel TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE web_payment_events ADD COLUMN confirmation_count INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE web_payment_events ADD COLUMN confirmed_at TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE web_payment_events ADD COLUMN subscription_activated INTEGER NOT NULL DEFAULT 0`,
+	} {
+		if _, err = tx.Exec(q); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
+			return err
+		}
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	if _, err = tx.Exec(`UPDATE web_invoices SET status='expired',updated_at=? WHERE status='pending' AND expires_at<=?`, now, now); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`INSERT OR IGNORE INTO schema_version(version) VALUES(6)`); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 func (s *Store) PinWalletRoot(xpub string) error {
 	digest := sha256.Sum256([]byte(strings.TrimSpace(xpub)))
@@ -191,12 +257,13 @@ func (s *Store) SetPrice(admin int64, bnb string) error {
 type AdminWebUser struct {
 	ID                int64  `json:"id"`
 	Email             string `json:"email"`
+	Plan              string `json:"plan"`
 	SubscriptionUntil string `json:"subscription_until"`
 	Address           string `json:"address"`
 }
 
 func (s *Store) AdminUsers() ([]AdminWebUser, error) {
-	rows, e := s.DB.Query(`SELECT u.id,u.email,u.subscription_until,COALESCE(w.address,'') FROM web_users u LEFT JOIN web_wallets w ON w.user_id=u.id ORDER BY u.id DESC LIMIT 200`)
+	rows, e := s.DB.Query(`SELECT u.id,u.email,u.plan_id,u.subscription_until,COALESCE(w.address,'') FROM web_users u LEFT JOIN web_wallets w ON w.user_id=u.id ORDER BY u.id DESC LIMIT 200`)
 	if e != nil {
 		return nil, e
 	}
@@ -204,7 +271,7 @@ func (s *Store) AdminUsers() ([]AdminWebUser, error) {
 	var out []AdminWebUser
 	for rows.Next() {
 		var u AdminWebUser
-		if e = rows.Scan(&u.ID, &u.Email, &u.SubscriptionUntil, &u.Address); e != nil {
+		if e = rows.Scan(&u.ID, &u.Email, &u.Plan, &u.SubscriptionUntil, &u.Address); e != nil {
 			return nil, e
 		}
 		out = append(out, u)

@@ -21,6 +21,7 @@ import (
 	"tradebot/internal/custody"
 	"tradebot/internal/domain"
 	"tradebot/internal/engine"
+	"tradebot/internal/entitlement"
 	"tradebot/internal/marketdata"
 	"tradebot/internal/profile"
 )
@@ -200,6 +201,7 @@ func (b Bot) Run(ctx context.Context) error {
 	var lastPollWarning time.Time
 	pollHealthy := false
 	go b.monitor(ctx)
+	go b.runPaymentNotifications(ctx)
 	for ctx.Err() == nil {
 		var list []update
 		e := b.call(ctx, "getUpdates", map[string]any{"offset": offset, "timeout": 25, "allowed_updates": []string{"message", "callback_query", "pre_checkout_query"}}, &list)
@@ -316,6 +318,15 @@ func (b Bot) handle(ctx context.Context, x update) {
 		return
 	}
 	if callback == "back" {
+		if strings.HasPrefix(u.State, "style:") {
+			parts := strings.Split(strings.TrimPrefix(u.State, "style:"), ":")
+			if len(parts) == 2 {
+				u.State = "frame:" + parts[0]
+				b.Store.Save(u)
+				b.frames(ctx, chat)
+				return
+			}
+		}
 		switch u.State {
 		case "min":
 			u.State = "markets"
@@ -456,13 +467,14 @@ func (b Bot) handle(ctx context.Context, x update) {
 		return
 	}
 	if callback == "check_subscription" {
-		active, until, e := b.Store.Subscription(id)
+		access, e := b.Store.Access(id, time.Now())
 		if e != nil {
 			_ = b.send(ctx, chat, customEmoji(EmojiFailure)+" بررسی اشتراک فعلاً ناموفق بود.", nil)
 			return
 		}
-		if active {
-			_ = b.send(ctx, chat, customEmoji(EmojiSuccess)+" اشتراک شما فعال است و تا <b>"+until.In(time.FixedZone("تهران", 12600)).Format("2006-01-02 15:04")+"</b> اعتبار دارد.", [][]map[string]any{{b.keyButton("🔄 تحلیل جدید", "analyze", "ANALYZE")}})
+		if access.SubscriptionActive {
+			until, _ := time.Parse(time.RFC3339, access.SubscriptionUntil)
+			_ = b.send(ctx, chat, customEmoji(EmojiSuccess)+" طرح <b>"+access.Policy.Label+"</b> شما تا <b>"+until.In(time.FixedZone("تهران", 12600)).Format("2006-01-02 15:04")+"</b> فعال است.", [][]map[string]any{{b.keyButton("🔄 تحلیل جدید", "analyze", "ANALYZE")}})
 		} else {
 			_ = b.send(ctx, chat, customEmoji(EmojiExpiration)+" اشتراک فعال ندارید یا اعتبار آن به پایان رسیده است.", [][]map[string]any{{b.keyButton("خرید اشتراک", "buy", "SUBSCRIPTION")}})
 		}
@@ -490,18 +502,56 @@ func (b Bot) handle(ctx context.Context, x update) {
 		b.frames(ctx, chat)
 		return
 	}
-	if strings.HasPrefix(callback, "f:") && strings.HasPrefix(u.State, "frame:") {
-		i, _ := strconv.Atoi(strings.TrimPrefix(callback, "f:"))
-		if i < 0 || i >= len(catalog.Frames) {
+	if strings.HasPrefix(callback, "f:") {
+		symbol := ""
+		switch {
+		case strings.HasPrefix(u.State, "frame:"):
+			symbol = strings.TrimPrefix(u.State, "frame:")
+		case strings.HasPrefix(u.State, "style:"):
+			parts := strings.Split(strings.TrimPrefix(u.State, "style:"), ":")
+			if len(parts) == 2 {
+				symbol = parts[0]
+			}
+		case strings.HasPrefix(u.State, "riskreview:"):
+			parts := strings.Split(strings.TrimPrefix(u.State, "riskreview:"), ":")
+			if len(parts) == 3 {
+				symbol = parts[0]
+			}
+		case strings.HasPrefix(u.State, "confirm:"):
+			parts := strings.Split(strings.TrimPrefix(u.State, "confirm:"), ":")
+			if len(parts) == 3 {
+				symbol = parts[0]
+			}
+		}
+		if symbol == "" {
+			b.send(ctx, chat, customEmoji(EmojiAttention)+" این انتخاب منقضی شده است. لطفاً تایم‌فریم را دوباره انتخاب کنید.", [][]map[string]any{{button("بازگشت به تایم‌فریم‌ها", "analyze"), button("🏠 منوی اصلی", "menu")}})
 			return
 		}
-		u.State = "style:" + strings.TrimPrefix(u.State, "frame:") + ":" + string(catalog.Frames[i])
+		i, _ := strconv.Atoi(strings.TrimPrefix(callback, "f:"))
+		if i < 0 || i >= len(catalog.Frames) {
+			b.send(ctx, chat, customEmoji(EmojiAttention)+" تایم‌فریم انتخاب‌شده معتبر نیست.", [][]map[string]any{{button("انتخاب دوباره", "analyze")}})
+			return
+		}
+		frame := catalog.Frames[i]
+		// Selecting a new timeframe always clears a previously selected horizon.
+		u.State = "style:" + symbol + ":" + string(frame)
 		b.Store.Save(u)
-		b.send(ctx, chat, "چه نوع معامله‌ای مدنظرته؟", [][]map[string]any{{button("⚡ اسکلپ", "y:scalp"), button("📈 روزانه", "y:day")}, {button("📊 میان‌مدت", "y:swing"), button("🗓 بلندمدت", "y:position")}, {button("بازگشت", "back"), button("انصراف", "cancel")}})
+		b.horizons(ctx, chat, frame)
 		return
 	}
-	if strings.HasPrefix(callback, "y:") && strings.HasPrefix(u.State, "style:") {
-		u.State = "riskreview:" + strings.TrimPrefix(u.State, "style:") + ":" + strings.TrimPrefix(callback, "y:")
+	if strings.HasPrefix(callback, "y:") {
+		parts := strings.Split(strings.TrimPrefix(u.State, "style:"), ":")
+		horizon, he := catalog.ParseHorizon(strings.TrimPrefix(callback, "y:"))
+		if !strings.HasPrefix(u.State, "style:") || len(parts) != 2 || he != nil || catalog.ValidateCombination(catalog.Timeframe(parts[1]), string(horizon)) != nil {
+			b.send(ctx, chat, customEmoji(EmojiAttention)+" این افق معاملاتی با تایم‌فریم انتخاب‌شده سازگار نیست. لطفاً انتخاب معتبر انجام دهید.", [][]map[string]any{{button("انتخاب دوباره", "analyze"), button("🏠 منوی اصلی", "menu")}})
+			return
+		}
+		access, ae := b.Store.Access(id, time.Now())
+		if ae != nil || !access.Policy.Allows(parts[0], catalog.Timeframe(parts[1]), horizon) {
+			b.send(ctx, chat, customEmoji(EmojiAttention)+" این ترکیب در طرح فعلی شما در دسترس نیست.", [][]map[string]any{{button("انتخاب دوباره", "analyze")}})
+			return
+		}
+		u.State = "riskreview:" + strings.TrimPrefix(u.State, "style:") + ":" + string(horizon)
 		b.Store.Save(u)
 		b.send(ctx, chat, "<b>"+customEmoji(EmojiRisk)+" تنظیم ریسک</b>\n\n"+fmt.Sprintf("حداقل سود: <b>%.2f%%</b>\nحداکثر سود: <b>%.2f%%</b>\nسقف ریسک: <b>%.2f%%</b>", u.MinProfit, u.MaxProfit, u.MaxRisk), [][]map[string]any{{button("تأیید و ادامه", "risk:ok"), button("⚙️ ویرایش تنظیمات", "settings")}, {button("🏠 منوی اصلی", "menu")}})
 		return
@@ -558,7 +608,8 @@ func (b Bot) handle(ctx context.Context, x update) {
 			u.State = "menu"
 			b.Store.Save(u)
 			if e == profile.ErrQuota {
-				b.send(ctx, chat, customEmoji(EmojiExpiration)+" سهمیهٔ تحلیل رایگان امروز مصرف شده است. برای دسترسی بیشتر، حساب وب را متصل کنید یا اشتراک را بررسی کنید.", [][]map[string]any{{button("اتصال حساب وب", "link"), b.keyButton("بررسی اشتراک", "check_subscription", "PAYMENT")}, {b.keyButton("خرید اشتراک", "buy", "SUBSCRIPTION")}})
+				access, _ := b.Store.Access(id, time.Now())
+				b.send(ctx, chat, customEmoji(EmojiExpiration)+" سهمیهٔ روزانهٔ طرح <b>"+access.Policy.Label+"</b> مصرف شده است. سهمیه در ابتدای روز تقویمی تهران بازنشانی می‌شود.", [][]map[string]any{{b.keyButton("بررسی اشتراک", "check_subscription", "PAYMENT"), b.keyButton("خرید اشتراک", "buy", "SUBSCRIPTION")}})
 			} else {
 				b.send(ctx, chat, customEmoji(EmojiFailure)+" خطا در ثبت درخواست تحلیل: "+html.EscapeString(e.Error()), nil)
 			}
@@ -584,17 +635,19 @@ func (b Bot) freshMenu(ctx context.Context, id int64) {
 }
 
 func (b Bot) renderMenu(ctx context.Context, id int64, forceNew bool) {
-	active, until, _ := b.Store.Subscription(id)
-	status := "غیرفعال"
-	if active {
-		status = "فعال تا " + until.In(time.FixedZone("تهران", 12600)).Format("2006/01/02 15:04")
+	access, _ := b.Store.Access(id, time.Now())
+	status := access.Policy.Label
+	quota := fmt.Sprintf("%d از %d باقی‌مانده", access.Remaining, access.Allowance)
+	if access.Allowance < 0 {
+		quota = "نامحدود"
 	}
 	wallet := "ساخته نشده"
 	if _, e := b.Store.Wallet(id); e == nil {
 		wallet = "آماده"
 	}
 	msg := "<b>" + customEmoji(EmojiMarketAnalysis) + " مارکت‌رادار</b>\nدستیار تحلیل و اشتراک بازارهای مالی\n\n" +
-		customEmoji(EmojiSuccess) + " وضعیت اشتراک: <b>" + html.EscapeString(status) + "</b>\n" +
+		customEmoji(EmojiSuccess) + " طرح دسترسی: <b>" + html.EscapeString(status) + "</b>\n" +
+		customEmoji(EmojiWait) + " سهمیهٔ امروز: <b>" + quota + "</b>\n" +
 		customEmoji(EmojiBNB) + " کیف‌پول BSC: <b>" + wallet + "</b>\n\n" +
 		"یک گزینه را انتخاب کنید:"
 	buttons := [][]map[string]any{
@@ -671,6 +724,20 @@ func (b Bot) frames(ctx context.Context, id int64) {
 		rows = append(rows, row)
 	}
 	b.send(ctx, id, "<b>"+customEmoji(EmojiTimeframe)+" انتخاب تایم‌فریم</b>", rows)
+}
+
+func (b Bot) horizons(ctx context.Context, id int64, frame catalog.Timeframe) {
+	allowed := catalog.AllowedHorizons(frame)
+	rows := make([][]map[string]any, 0, (len(allowed)+1)/2+1)
+	for i := 0; i < len(allowed); i += 2 {
+		row := []map[string]any{button(allowed[i].LabelFA(), "y:"+string(allowed[i]))}
+		if i+1 < len(allowed) {
+			row = append(row, button(allowed[i+1].LabelFA(), "y:"+string(allowed[i+1])))
+		}
+		rows = append(rows, row)
+	}
+	rows = append(rows, []map[string]any{button("بازگشت", "back"), button("انصراف", "cancel")})
+	b.send(ctx, id, "<b>افق معاملاتی</b>\n\nفقط گزینه‌های سازگار با "+frame.Label()+" نمایش داده می‌شوند.", rows)
 }
 func (b Bot) onboard(ctx context.Context, id int64, u profile.User, text, cb string) {
 	if text == "/start" && u.State == "menu" {
@@ -842,17 +909,22 @@ func (b Bot) help(ctx context.Context, id int64) {
 }
 
 func (b Bot) subscriptionDashboard(ctx context.Context, id int64) {
-	active, until, e := b.Store.Subscription(id)
+	access, e := b.Store.Access(id, time.Now())
 	if e != nil {
 		_ = b.screen(ctx, id, "<b>"+customEmoji(EmojiFailure)+" اشتراک من</b>\n\n"+customEmoji(EmojiAttention)+" دریافت وضعیت اشتراک ناموفق بود.", [][]map[string]any{{button("تلاش دوباره", "subscription"), button("🏠 خانه", "menu")}})
 		return
 	}
-	status := customEmoji(EmojiExpiration) + " اشتراک فعالی ندارید."
-	if active {
-		status = customEmoji(EmojiSuccess) + " اشتراک فعال است.\n\n" + customEmoji(EmojiExpiration) + " اعتبار تا: <b>" + until.In(time.FixedZone("تهران", 12600)).Format("2006/01/02 15:04") + "</b>"
+	remaining := fmt.Sprintf("%d از %d", access.Remaining, access.Allowance)
+	if access.Allowance < 0 {
+		remaining = "نامحدود"
+	}
+	status := customEmoji(EmojiExpiration) + " طرح: <b>Visitor</b>\nسهمیهٔ امروز: <b>" + remaining + "</b>"
+	if access.SubscriptionActive {
+		until, _ := time.Parse(time.RFC3339, access.SubscriptionUntil)
+		status = customEmoji(EmojiSuccess) + " طرح <b>" + access.Policy.Label + "</b> فعال است.\nسهمیهٔ امروز: <b>" + remaining + "</b>\n\n" + customEmoji(EmojiExpiration) + " اعتبار تا: <b>" + until.In(time.FixedZone("تهران", 12600)).Format("2006/01/02 15:04") + "</b>"
 	}
 	rows := [][]map[string]any{{button("🔄 بررسی مجدد", "subscription"), button("💳 پرداخت‌ها", "payments")}}
-	if !active {
+	if !access.SubscriptionActive {
 		rows = append([][]map[string]any{{button("🛒 خرید یا تمدید", "buy")}}, rows...)
 	}
 	rows = append(rows, []map[string]any{button("🏠 منوی اصلی", "menu")})
@@ -942,7 +1014,7 @@ func (b Bot) paymentHistory(ctx context.Context, chat, id int64, page int) {
 			fmt.Fprintf(&sb, "\nتراکنش: <code>%s</code>", html.EscapeString(inv.TxHash))
 		}
 		if inv.Status == "paid" {
-			sb.WriteString("\nاعتبار اعطاشده: <b>یک ماه اشتراک</b>")
+			sb.WriteString("\nاعتبار اعطاشده: <b>یک ماه طرح Standard</b>")
 		}
 	}
 	var nav []map[string]any
@@ -998,7 +1070,18 @@ func (b Bot) checkout(ctx context.Context, chat, id int64) {
 	}
 	if inv.ID == "" {
 		expires := now.Add(15 * time.Minute)
-		inv, e = b.Store.CreateTelegramInvoice(id, address, price.String(), 56, expires)
+		if b.Chain == nil {
+			_ = b.send(ctx, chat, customEmoji(EmojiFailure)+" پایش شبکه در دسترس نیست؛ فاکتور ساخته نشد.", nil)
+			return
+		}
+		readCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		head, headErr := b.Chain.Head(readCtx)
+		cancel()
+		if headErr != nil {
+			_ = b.send(ctx, chat, customEmoji(EmojiFailure)+" ارتباط شبکه موقتاً در دسترس نیست؛ فاکتور ساخته نشد.", nil)
+			return
+		}
+		inv, e = b.Store.CreateTelegramInvoice(id, address, price.String(), 56, expires, head+1)
 		if e != nil {
 			_ = b.send(ctx, chat, customEmoji(EmojiFailure)+" ساخت فاکتور ناموفق بود. دوباره تلاش کنید.", nil)
 			return
@@ -1006,7 +1089,7 @@ func (b Bot) checkout(ctx context.Context, chat, id int64) {
 	}
 	amount := formatBNB(inv.PriceWei)
 	expiresTehran := inv.ExpiresAt.In(time.FixedZone("تهران", 12600)).Format("2006-01-02 15:04")
-	msg := fmt.Sprintf("<b>%s فاکتور اشتراک یک‌ماهه</b>\n\n%s <b>مبلغ دقیق:</b> %s BNB\n🌐 <b>شبکه:</b> BSC Mainnet\n%s <b>مهلت:</b> %s\n\n%s <b>آدرس واریز:</b>\n<code>%s</code>\n\nشماره فاکتور:\n<code>%s</code>", customEmoji(EmojiInvoice), customEmoji(EmojiBNB), amount, customEmoji(EmojiExpiration), expiresTehran, customEmoji(EmojiEntryPoint), html.EscapeString(inv.Address), html.EscapeString(inv.ID))
+	msg := fmt.Sprintf("<b>%s فاکتور یک‌ماههٔ Standard</b>\n\nسهمیه: <b>%d تحلیل موفق در روز</b>\n%s <b>مبلغ دقیق:</b> %s BNB\n🌐 <b>شبکه:</b> BSC Mainnet\n%s <b>مهلت:</b> %s\n\n%s <b>آدرس واریز:</b>\n<code>%s</code>\n\nشماره فاکتور:\n<code>%s</code>", customEmoji(EmojiInvoice), entitlement.Defaults[entitlement.Standard].DailyAllowance, customEmoji(EmojiBNB), amount, customEmoji(EmojiExpiration), expiresTehran, customEmoji(EmojiEntryPoint), html.EscapeString(inv.Address), html.EscapeString(inv.ID))
 	rows := [][]map[string]any{
 		{copyButton("📋 کپی آدرس", inv.Address), button("🔄 بررسی پرداخت", "check_payment")},
 		{button("💳 پرداخت‌ها", "payments"), button("🏠 خانه", "menu")},

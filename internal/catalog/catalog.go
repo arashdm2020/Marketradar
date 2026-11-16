@@ -7,7 +7,70 @@ import (
 
 type Timeframe string
 
+type Horizon string
+
+const (
+	HorizonScalp    Horizon = "scalp"
+	HorizonIntraday Horizon = "day"
+	HorizonSwing    Horizon = "swing"
+	HorizonPosition Horizon = "position"
+)
+
 var Frames = []Timeframe{"1min", "5min", "15min", "30min", "1h", "4h", "1day", "1week"}
+
+// HorizonMatrix is product policy, not a universal trading rule. Keep every
+// UI and backend admission check based on this single authoritative matrix.
+var HorizonMatrix = map[Timeframe][]Horizon{
+	"1min":  {HorizonScalp},
+	"5min":  {HorizonScalp, HorizonIntraday},
+	"15min": {HorizonScalp, HorizonIntraday},
+	"30min": {HorizonIntraday},
+	"1h":    {HorizonIntraday, HorizonSwing},
+	"4h":    {HorizonIntraday, HorizonSwing, HorizonPosition},
+	"1day":  {HorizonSwing, HorizonPosition},
+	"1week": {HorizonPosition},
+}
+
+func ParseHorizon(s string) (Horizon, error) {
+	h := Horizon(s)
+	for _, candidate := range []Horizon{HorizonScalp, HorizonIntraday, HorizonSwing, HorizonPosition} {
+		if h == candidate {
+			return h, nil
+		}
+	}
+	return "", fmt.Errorf("unsupported trading horizon %q", s)
+}
+
+func (h Horizon) LabelFA() string {
+	return map[Horizon]string{HorizonScalp: "اسکالپ", HorizonIntraday: "روزانه", HorizonSwing: "میان‌مدت", HorizonPosition: "بلندمدت"}[h]
+}
+
+func AllowedHorizons(frame Timeframe) []Horizon {
+	return append([]Horizon(nil), HorizonMatrix[frame]...)
+}
+
+func Compatible(frame Timeframe, horizon Horizon) bool {
+	for _, allowed := range HorizonMatrix[frame] {
+		if allowed == horizon {
+			return true
+		}
+	}
+	return false
+}
+
+func ValidateCombination(frame Timeframe, horizon string) error {
+	if _, err := ParseFrame(string(frame)); err != nil {
+		return err
+	}
+	h, err := ParseHorizon(horizon)
+	if err != nil {
+		return err
+	}
+	if !Compatible(frame, h) {
+		return fmt.Errorf("trading horizon %q is incompatible with timeframe %q", horizon, frame)
+	}
+	return nil
+}
 
 func ParseFrame(s string) (Timeframe, error) {
 	for _, f := range Frames {

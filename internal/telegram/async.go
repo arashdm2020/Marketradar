@@ -107,6 +107,17 @@ func (w *AsyncWorker) Stop() {
 
 // Enqueue queues an analysis request. Returns false if a request for the same user is already in flight.
 func (w *AsyncWorker) Enqueue(ctx context.Context, req AnalysisRequest) (bool, error) {
+	horizon, e := catalog.ParseHorizon(req.Style)
+	if e != nil || catalog.ValidateCombination(req.Timeframe, req.Style) != nil {
+		return false, errors.New("invalid timeframe and trading horizon combination")
+	}
+	access, e := w.store.Access(req.UserID, time.Now())
+	if e != nil {
+		return false, e
+	}
+	if !access.Policy.Allows(req.Symbol, req.Timeframe, horizon) {
+		return false, errors.New("analysis selection is not allowed by entitlement policy")
+	}
 	w.inflightMu.Lock()
 	if _, exists := w.inflight[req.UserID]; exists {
 		w.inflightMu.Unlock()
@@ -119,6 +130,9 @@ func (w *AsyncWorker) Enqueue(ctx context.Context, req AnalysisRequest) (bool, e
 		w.inflightMu.Lock()
 		delete(w.inflight, req.UserID)
 		w.inflightMu.Unlock()
+		if errors.Is(e, profile.ErrDuplicateAnalysis) {
+			return false, nil
+		}
 		return false, e
 	}
 
@@ -129,7 +143,7 @@ func (w *AsyncWorker) Enqueue(ctx context.Context, req AnalysisRequest) (bool, e
 		w.inflightMu.Unlock()
 		return false, e
 	}
-	_, _ = w.store.DB.Exec(`UPDATE request_states SET config_version=?,horizon_candles=?,engine_candles=0,model_candles=0 WHERE id=?`, req.ConfigVersion, req.HorizonCandles, req.ID)
+	_, _ = w.store.DB.Exec(`UPDATE request_states SET config_version=?,horizon_candles=?,engine_candles=0,model_candles=0,plan_id=? WHERE id=?`, req.ConfigVersion, req.HorizonCandles, string(access.Policy.ID), req.ID)
 
 	select {
 	case w.ch <- req:
@@ -260,18 +274,16 @@ func (w *AsyncWorker) process(ctx context.Context, req AnalysisRequest) {
 	_, _ = w.store.DB.Exec(`UPDATE request_states SET model=?,prompt_version=? WHERE id=?`, d.Model, d.PromptVersion, req.ID)
 	_ = w.store.Record(req.UserID, req.Symbol, string(req.Timeframe), req.Style, string(raw))
 	_ = w.store.UpdateRequestState(req.ID, "completed", string(raw), "", &msgID)
+	// A valid BUY/SELL/WAIT is the successful product outcome and consumes one
+	// allowance. Delivery failures must not cause a second model run or a second
+	// authoritative result for the same analysis UUID.
+	_ = w.store.SetUse(req.ID, "consumed")
 
 	if de := w.deliverFinal(deliveryCtx, req, msgID, d, nil); de != nil {
-		if IsDefinitiveRejection(de) {
-			_ = w.store.SetUse(req.ID, "released")
-		} else {
-			_ = w.store.SetUse(req.ID, "uncertain")
-		}
 		log.Error("final_delivery_failed", "error", de)
 		_ = w.store.UpdateRequestState(req.ID, "delivery_failed", string(raw), de.Error(), &msgID)
 		return
 	}
-	_ = w.store.SetUse(req.ID, "consumed")
 	_ = w.store.UpdateRequestState(req.ID, "delivered", string(raw), "", &msgID)
 	log.Info("final_delivery_accepted", "duration_ms", time.Since(start).Milliseconds(), "status", d.Final)
 }

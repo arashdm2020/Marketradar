@@ -103,6 +103,16 @@ func (f *failingEngine) Analyze(ctx context.Context, r engine.Request) (domain.D
 	return domain.Decision{}, errors.New("NVIDIA service unavailable")
 }
 
+type finalDeliveryFailBot struct{ calls int }
+
+func (b *finalDeliveryFailBot) sendText(context.Context, int64, string, [][]map[string]any) (int64, error) {
+	b.calls++
+	if b.calls > 1 {
+		return 0, errors.New("telegram delivery unavailable")
+	}
+	return 1, nil
+}
+
 // ---- async worker tests ----
 
 func TestAsyncWorkerDedup(t *testing.T) {
@@ -220,6 +230,54 @@ func TestAsyncWorkerOverloadMessageAndQuotaRelease(t *testing.T) {
 	state, e := store.GetRequestState(req.ID)
 	if e != nil || state.Status != "failed" {
 		t.Fatalf("request state=%+v err=%v", state, e)
+	}
+}
+
+func TestQueueRejectsInvalidTimeframeHorizonBeforeReservation(t *testing.T) {
+	store, e := profile.Open(t.TempDir() + "/invalid-combination.db")
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer store.DB.Close()
+	if _, e = store.Ensure(204); e != nil {
+		t.Fatal(e)
+	}
+	w := NewAsyncWorker(&mockBot{}, store, &mockEngine{})
+	queued, e := w.Enqueue(context.Background(), AnalysisRequest{ID: "invalid-combo", UserID: 204, ChatID: 204, Symbol: "XAU/USD", Timeframe: "30min", Style: "scalp"})
+	if e == nil || queued {
+		t.Fatalf("invalid combination queued=%v err=%v", queued, e)
+	}
+	var n int
+	if e = store.DB.QueryRow(`SELECT count(*) FROM daily_uses WHERE analysis_id='invalid-combo'`).Scan(&n); e != nil || n != 0 {
+		t.Fatalf("invalid combination reserved quota: n=%d err=%v", n, e)
+	}
+}
+
+func TestValidAnalysisConsumesQuotaEvenWhenFinalDeliveryFails(t *testing.T) {
+	store, e := profile.Open(t.TempDir() + "/delivery-fail.db")
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer store.DB.Close()
+	if _, e = store.Ensure(205); e != nil {
+		t.Fatal(e)
+	}
+	requestID := "valid-result-delivery-failed"
+	if e = store.Reserve(requestID, 205, time.Now()); e != nil {
+		t.Fatal(e)
+	}
+	if e = store.CreateRequestState(requestID, "205", "205", "XAU/USD", "5min", "day"); e != nil {
+		t.Fatal(e)
+	}
+	w := NewAsyncWorker(&finalDeliveryFailBot{}, store, &mockEngine{})
+	w.process(context.Background(), AnalysisRequest{ID: requestID, UserID: 205, ChatID: 205, Symbol: "XAU/USD", Timeframe: "5min", Style: "day"})
+	var status string
+	if e = store.DB.QueryRow(`SELECT status FROM daily_uses WHERE analysis_id=?`, requestID).Scan(&status); e != nil || status != "consumed" {
+		t.Fatalf("status=%s err=%v", status, e)
+	}
+	var requestStatus string
+	if e = store.DB.QueryRow(`SELECT status FROM request_states WHERE id=?`, requestID).Scan(&requestStatus); e != nil || requestStatus != "delivery_failed" {
+		t.Fatalf("request status=%s err=%v", requestStatus, e)
 	}
 }
 

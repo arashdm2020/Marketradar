@@ -2,6 +2,7 @@ package profile
 
 import (
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -148,7 +149,7 @@ func TestPaymentIdempotencyAndAnalysisLookup(t *testing.T) {
 		t.Fatalf("lookup: %+v %v", a, e)
 	}
 }
-func TestLegacyTelegramSubscriptionDoesNotBypassFreeQuota(t *testing.T) {
+func TestPaidTelegramSubscriptionUsesStandardQuota(t *testing.T) {
 	s, e := Open(t.TempDir() + "/legacy.db")
 	if e != nil {
 		t.Fatal(e)
@@ -159,12 +160,15 @@ func TestLegacyTelegramSubscriptionDoesNotBypassFreeQuota(t *testing.T) {
 	if e = s.ActivateOnce(77, "legacy-charge", "telegram_stars", now); e != nil {
 		t.Fatal(e)
 	}
-	if e = s.Reserve("first", 77, now); e != nil {
-		t.Fatal(e)
+	for i := 0; i < 5; i++ {
+		id := fmt.Sprintf("paid-%d", i)
+		if e = s.Reserve(id, 77, now); e != nil {
+			t.Fatal(e)
+		}
+		_ = s.SetUse(id, "consumed")
 	}
-	_ = s.SetUse("first", "consumed")
-	if e = s.Reserve("second", 77, now); !errors.Is(e, ErrQuota) {
-		t.Fatalf("legacy subscription bypassed free quota: %v", e)
+	if e = s.Reserve("sixth", 77, now); !errors.Is(e, ErrQuota) {
+		t.Fatalf("standard quota not enforced: %v", e)
 	}
 }
 func TestConfigSwitchAndAudit(t *testing.T) {

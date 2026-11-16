@@ -43,7 +43,7 @@ func TestBotQuotaRoutesToPurchaseAndExemptCanContinue(t *testing.T) {
 	}
 	b.handle(context.Background(), event)
 	joined := strings.Join(transport.bodies, "\n")
-	if !strings.Contains(joined, "buy") || !strings.Contains(joined, "link") || !strings.Contains(joined, "check_subscription") || !strings.Contains(joined, "سهمیهٔ تحلیل رایگان امروز") {
+	if !strings.Contains(joined, "buy") || !strings.Contains(joined, "check_subscription") || !strings.Contains(joined, "سهمیهٔ روزانهٔ طرح") {
 		t.Fatal("user was not routed to purchase")
 	}
 	if e = store.SetExempt(profile.AdminID, 99, true); e != nil {

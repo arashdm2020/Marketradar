@@ -41,6 +41,9 @@ func (e Engine) Analyze(ctx context.Context, r Request) (domain.Decision, error)
 	if _, err := catalog.ParseFrame(string(r.Timeframe)); err != nil {
 		return domain.Decision{}, err
 	}
+	if err := catalog.ValidateCombination(r.Timeframe, r.Style); err != nil {
+		return domain.Decision{}, err
+	}
 	count := r.EngineCandles
 	if count == 0 {
 		count = 500

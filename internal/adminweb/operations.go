@@ -64,7 +64,7 @@ func (s *Server) operationsPayments(w http.ResponseWriter, r *http.Request) {
 	if !s.guard(w, r) {
 		return
 	}
-	rows, e := s.Store.DB.Query(`SELECT i.id,i.user_id,i.address,i.price_wei,i.chain_id,i.created_at,i.expires_at,i.status,i.tx_hash,COALESCE(p.amount_wei,''),COALESCE(p.block_time,''),COALESCE(p.classification,'') FROM web_invoices i LEFT JOIN web_payment_events p ON p.tx_hash=i.tx_hash ORDER BY i.created_at DESC LIMIT 500`)
+	rows, e := s.Store.DB.Query(`SELECT id,user_id,address,price_wei,chain_id,created_at,expires_at,status,tx_hash,channel FROM (SELECT id,user_id,address,price_wei,chain_id,created_at,expires_at,status,tx_hash,'web' channel FROM web_invoices UNION ALL SELECT id,telegram_id,address,price_wei,chain_id,created_at,expires_at,status,tx_hash,'telegram' channel FROM telegram_invoices) ORDER BY created_at DESC LIMIT 500`)
 	if e != nil {
 		http.Error(w, "payments unavailable", 500)
 		return
@@ -72,11 +72,22 @@ func (s *Server) operationsPayments(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 	out := []map[string]any{}
 	for rows.Next() {
-		var id, address, price, created, expires, status, hash, amount, blockTime, class string
+		var id, address, price, created, expires, status, hash, channel string
 		var uid, chain int64
-		if rows.Scan(&id, &uid, &address, &price, &chain, &created, &expires, &status, &hash, &amount, &blockTime, &class) == nil {
-			out = append(out, map[string]any{"id": id, "user_id": uid, "address": address, "price_wei": price, "chain_id": chain, "created_at": created, "expires_at": expires, "status": status, "tx_hash": hash, "amount_wei": amount, "block_time": blockTime, "classification": class})
+		if rows.Scan(&id, &uid, &address, &price, &chain, &created, &expires, &status, &hash, &channel) == nil {
+			out = append(out, map[string]any{"id": id, "user_id": uid, "channel": channel, "address": address, "price_wei": price, "chain_id": chain, "created_at": created, "expires_at": expires, "status": status, "tx_hash": hash})
 		}
+	}
+	rows.Close()
+	for _, item := range out {
+		var amount, blockTime, class, notification string
+		var confirmations, activated int
+		hash, _ := item["tx_hash"].(string)
+		id, _ := item["id"].(string)
+		_ = s.Store.DB.QueryRow(`SELECT amount_wei,block_time,classification,confirmation_count,subscription_activated FROM web_payment_events WHERE tx_hash=? OR invoice_id=? ORDER BY seen_at DESC LIMIT 1`, hash, id).Scan(&amount, &blockTime, &class, &confirmations, &activated)
+		_ = s.Store.DB.QueryRow(`SELECT COALESCE(group_concat(kind||':'||status,','),'') FROM payment_notification_outbox WHERE invoice_id=?`, id).Scan(&notification)
+		item["amount_wei"], item["block_time"], item["classification"] = amount, blockTime, class
+		item["confirmation_count"], item["subscription_activated"], item["notification_status"] = confirmations, activated == 1, notification
 	}
 	jsonOut(w, out)
 }
@@ -93,7 +104,7 @@ func (s *Server) operationsFinance(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	invoiceRows, e := s.Store.DB.Query(`SELECT status,price_wei,created_at FROM web_invoices WHERE (?='' OR substr(created_at,1,10)>=?) AND (?='' OR substr(created_at,1,10)<=?)`, from, from, to, to)
+	invoiceRows, e := s.Store.DB.Query(`SELECT status,price_wei,created_at FROM (SELECT status,price_wei,created_at FROM web_invoices UNION ALL SELECT status,price_wei,created_at FROM telegram_invoices) WHERE (?='' OR substr(created_at,1,10)>=?) AND (?='' OR substr(created_at,1,10)<=?)`, from, from, to, to)
 	if e != nil {
 		http.Error(w, "finance unavailable", 500)
 		return
@@ -125,7 +136,7 @@ func (s *Server) operationsFinance(w http.ResponseWriter, r *http.Request) {
 		var classification, amount, at string
 		if paymentRows.Scan(&classification, &amount, &at) == nil {
 			paymentStates[classification]++
-			if classification == "paid" {
+			if classification == "paid" || classification == "paid_telegram" {
 				if n, ok := new(big.Int).SetString(amount, 10); ok {
 					confirmed.Add(confirmed, n)
 					day := at

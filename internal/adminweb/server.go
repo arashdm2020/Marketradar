@@ -18,6 +18,7 @@ import (
 	"time"
 	"tradebot/internal/aimgmt"
 	"tradebot/internal/custody"
+	"tradebot/internal/entitlement"
 	"tradebot/internal/profile"
 	"tradebot/internal/treasury"
 	"tradebot/internal/webapp"
@@ -363,7 +364,12 @@ func (s *Server) subscriptionGrant(w http.ResponseWriter, r *http.Request) {
 	id, e := strconv.ParseInt(r.FormValue("user_id"), 10, 64)
 	days, e2 := strconv.Atoi(r.FormValue("days"))
 	channel := r.FormValue("channel")
-	if e != nil || e2 != nil || days < 0 || days > 365 || channel != "telegram" && channel != "web" {
+	planRaw := strings.ToLower(strings.TrimSpace(r.FormValue("plan")))
+	if planRaw == "" || planRaw == "public" {
+		planRaw = "standard"
+	}
+	plan := entitlement.Normalize(planRaw)
+	if e != nil || e2 != nil || days < 0 || days > 365 || channel != "telegram" && channel != "web" || planRaw != "standard" && planRaw != "premium" {
 		http.Error(w, "invalid grant", 400)
 		return
 	}
@@ -378,12 +384,12 @@ func (s *Server) subscriptionGrant(w http.ResponseWriter, r *http.Request) {
 		until = time.Now().UTC().AddDate(0, 0, days).Format(time.RFC3339)
 	}
 	if channel == "telegram" {
-		_, e = tx.Exec(`INSERT INTO entitlements(user_id,subscription_until) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET subscription_until=excluded.subscription_until`, id, until)
+		_, e = tx.Exec(`INSERT INTO entitlements(user_id,subscription_until,plan_id) VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET subscription_until=excluded.subscription_until,plan_id=excluded.plan_id`, id, until, string(plan))
 	} else {
-		_, e = tx.Exec(`UPDATE web_users SET subscription_until=? WHERE id=?`, until, id)
+		_, e = tx.Exec(`UPDATE web_users SET subscription_until=?,plan_id=? WHERE id=?`, until, string(plan), id)
 	}
 	if e == nil {
-		_, e = tx.Exec(`INSERT INTO admin_audit(admin_id,target_id,action,detail,at_utc) VALUES(?,?, 'subscription_grant',?,?)`, profile.AdminID, id, fmt.Sprintf("channel=%s days=%d", channel, days), time.Now().UTC().Format(time.RFC3339))
+		_, e = tx.Exec(`INSERT INTO admin_audit(admin_id,target_id,action,detail,at_utc) VALUES(?,?, 'subscription_grant',?,?)`, profile.AdminID, id, fmt.Sprintf("channel=%s days=%d plan=%s", channel, days, plan), time.Now().UTC().Format(time.RFC3339))
 	}
 	if e != nil || tx.Commit() != nil {
 		http.Error(w, "grant failed", 400)

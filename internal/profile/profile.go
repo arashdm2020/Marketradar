@@ -40,8 +40,10 @@ type TelegramInvoice struct {
 	ChainID    uint64    `json:"chain_id"`
 	CreatedAt  time.Time `json:"created_at"`
 	ExpiresAt  time.Time `json:"expires_at"`
+	StartBlock uint64    `json:"start_block"`
 	Status     string    `json:"status"`
 	TxHash     string    `json:"tx_hash,omitempty"`
+	UpdatedAt  time.Time `json:"updated_at"`
 }
 
 func Open(path string) (*Store, error) {
@@ -268,36 +270,65 @@ func (s *Store) WalletByAddress(address string) (int64, error) {
 	e := s.DB.QueryRow(`SELECT telegram_id FROM telegram_wallets WHERE lower(address)=lower(?)`, address).Scan(&id)
 	return id, e
 }
-func (s *Store) CreateTelegramInvoice(telegramID int64, address, priceWei string, chainID uint64, expiresAt time.Time) (TelegramInvoice, error) {
+func (s *Store) CreateTelegramInvoice(telegramID int64, address, priceWei string, chainID uint64, expiresAt time.Time, startBlocks ...uint64) (TelegramInvoice, error) {
 	id := NewID()
 	if id == "" {
 		return TelegramInvoice{}, errors.New("random unavailable")
 	}
 	now := time.Now().UTC()
-	_, e := s.DB.Exec(`INSERT INTO telegram_invoices(id,telegram_id,address,price_wei,chain_id,created_at,expires_at,status) VALUES(?,?,?,?,?,?,?,'pending')`,
-		id, telegramID, address, priceWei, chainID, now.Format(time.RFC3339), expiresAt.UTC().Format(time.RFC3339))
+	startBlock := uint64(0)
+	if len(startBlocks) > 0 {
+		startBlock = startBlocks[0]
+	}
+	tx, e := s.DB.Begin()
 	if e != nil {
 		return TelegramInvoice{}, e
 	}
-	return TelegramInvoice{ID: id, TelegramID: telegramID, Address: address, PriceWei: priceWei, ChainID: chainID, CreatedAt: now, ExpiresAt: expiresAt.UTC(), Status: "pending"}, nil
+	defer tx.Rollback()
+	if _, e = tx.Exec(`UPDATE telegram_invoices SET status='expired',updated_at=? WHERE telegram_id=? AND status='pending' AND expires_at<=?`, now.Format(time.RFC3339), telegramID, now.Format(time.RFC3339)); e != nil {
+		return TelegramInvoice{}, e
+	}
+	var existing TelegramInvoice
+	var created, expires, updated string
+	e = tx.QueryRow(`SELECT id,telegram_id,address,price_wei,chain_id,created_at,expires_at,start_block,status,tx_hash,updated_at FROM telegram_invoices WHERE telegram_id=? AND status='pending'`, telegramID).Scan(&existing.ID, &existing.TelegramID, &existing.Address, &existing.PriceWei, &existing.ChainID, &created, &expires, &existing.StartBlock, &existing.Status, &existing.TxHash, &updated)
+	if e == nil {
+		existing.CreatedAt, _ = time.Parse(time.RFC3339, created)
+		existing.ExpiresAt, _ = time.Parse(time.RFC3339, expires)
+		existing.UpdatedAt, _ = time.Parse(time.RFC3339, updated)
+		return existing, tx.Commit()
+	}
+	if e != sql.ErrNoRows {
+		return TelegramInvoice{}, e
+	}
+	_, e = tx.Exec(`INSERT INTO telegram_invoices(id,telegram_id,address,price_wei,chain_id,created_at,expires_at,start_block,status,updated_at) VALUES(?,?,?,?,?,?,?,?,'pending',?)`, id, telegramID, address, priceWei, chainID, now.Format(time.RFC3339), expiresAt.UTC().Format(time.RFC3339), startBlock, now.Format(time.RFC3339))
+	if e != nil {
+		return TelegramInvoice{}, e
+	}
+	if e = tx.Commit(); e != nil {
+		return TelegramInvoice{}, e
+	}
+	return TelegramInvoice{ID: id, TelegramID: telegramID, Address: address, PriceWei: priceWei, ChainID: chainID, CreatedAt: now, ExpiresAt: expiresAt.UTC(), StartBlock: startBlock, Status: "pending", UpdatedAt: now}, nil
 }
 func (s *Store) TelegramInvoice(telegramID int64, id string) (TelegramInvoice, error) {
 	var inv TelegramInvoice
-	var created, expires string
-	e := s.DB.QueryRow(`SELECT id,telegram_id,address,price_wei,chain_id,created_at,expires_at,status,tx_hash FROM telegram_invoices WHERE id=? AND telegram_id=?`, id, telegramID).Scan(&inv.ID, &inv.TelegramID, &inv.Address, &inv.PriceWei, &inv.ChainID, &created, &expires, &inv.Status, &inv.TxHash)
+	var created, expires, updated string
+	e := s.DB.QueryRow(`SELECT id,telegram_id,address,price_wei,chain_id,created_at,expires_at,start_block,status,tx_hash,updated_at FROM telegram_invoices WHERE id=? AND telegram_id=?`, id, telegramID).Scan(&inv.ID, &inv.TelegramID, &inv.Address, &inv.PriceWei, &inv.ChainID, &created, &expires, &inv.StartBlock, &inv.Status, &inv.TxHash, &updated)
 	if e != nil {
 		return inv, e
 	}
 	inv.CreatedAt, _ = time.Parse(time.RFC3339, created)
 	inv.ExpiresAt, _ = time.Parse(time.RFC3339, expires)
+	inv.UpdatedAt, _ = time.Parse(time.RFC3339, updated)
 	if inv.Status == "pending" && time.Now().After(inv.ExpiresAt) {
-		_, _ = s.DB.Exec(`UPDATE telegram_invoices SET status='expired' WHERE id=? AND status='pending'`, id)
+		_, _ = s.DB.Exec(`UPDATE telegram_invoices SET status='expired',updated_at=? WHERE id=? AND status='pending'`, time.Now().UTC().Format(time.RFC3339), id)
 		inv.Status = "expired"
 	}
 	return inv, nil
 }
 func (s *Store) ListTelegramInvoices(telegramID int64) ([]TelegramInvoice, error) {
-	rows, e := s.DB.Query(`SELECT id,telegram_id,address,price_wei,chain_id,created_at,expires_at,status,tx_hash FROM telegram_invoices WHERE telegram_id=? ORDER BY created_at DESC LIMIT 100`, telegramID)
+	now := time.Now().UTC().Format(time.RFC3339)
+	_, _ = s.DB.Exec(`UPDATE telegram_invoices SET status='expired',updated_at=? WHERE telegram_id=? AND status='pending' AND expires_at<=?`, now, telegramID, now)
+	rows, e := s.DB.Query(`SELECT id,telegram_id,address,price_wei,chain_id,created_at,expires_at,start_block,status,tx_hash,updated_at FROM telegram_invoices WHERE telegram_id=? ORDER BY created_at DESC LIMIT 100`, telegramID)
 	if e != nil {
 		return nil, e
 	}
@@ -305,12 +336,13 @@ func (s *Store) ListTelegramInvoices(telegramID int64) ([]TelegramInvoice, error
 	var out []TelegramInvoice
 	for rows.Next() {
 		var inv TelegramInvoice
-		var created, expires string
-		if e = rows.Scan(&inv.ID, &inv.TelegramID, &inv.Address, &inv.PriceWei, &inv.ChainID, &created, &expires, &inv.Status, &inv.TxHash); e != nil {
+		var created, expires, updated string
+		if e = rows.Scan(&inv.ID, &inv.TelegramID, &inv.Address, &inv.PriceWei, &inv.ChainID, &created, &expires, &inv.StartBlock, &inv.Status, &inv.TxHash, &updated); e != nil {
 			return nil, e
 		}
 		inv.CreatedAt, _ = time.Parse(time.RFC3339, created)
 		inv.ExpiresAt, _ = time.Parse(time.RFC3339, expires)
+		inv.UpdatedAt, _ = time.Parse(time.RFC3339, updated)
 		out = append(out, inv)
 	}
 	return out, rows.Err()
@@ -323,7 +355,9 @@ func (s *Store) PageTelegramInvoices(telegramID int64, limit, offset int) ([]Tel
 	if e := s.DB.QueryRow(`SELECT count(*) FROM telegram_invoices WHERE telegram_id=?`, telegramID).Scan(&total); e != nil {
 		return nil, 0, e
 	}
-	rows, e := s.DB.Query(`SELECT id,telegram_id,address,price_wei,chain_id,created_at,expires_at,status,tx_hash FROM telegram_invoices WHERE telegram_id=? ORDER BY created_at DESC LIMIT ? OFFSET ?`, telegramID, limit, offset)
+	now := time.Now().UTC().Format(time.RFC3339)
+	_, _ = s.DB.Exec(`UPDATE telegram_invoices SET status='expired',updated_at=? WHERE telegram_id=? AND status='pending' AND expires_at<=?`, now, telegramID, now)
+	rows, e := s.DB.Query(`SELECT id,telegram_id,address,price_wei,chain_id,created_at,expires_at,start_block,status,tx_hash,updated_at FROM telegram_invoices WHERE telegram_id=? ORDER BY created_at DESC LIMIT ? OFFSET ?`, telegramID, limit, offset)
 	if e != nil {
 		return nil, 0, e
 	}
@@ -331,12 +365,13 @@ func (s *Store) PageTelegramInvoices(telegramID int64, limit, offset int) ([]Tel
 	out := make([]TelegramInvoice, 0, limit)
 	for rows.Next() {
 		var inv TelegramInvoice
-		var created, expires string
-		if e = rows.Scan(&inv.ID, &inv.TelegramID, &inv.Address, &inv.PriceWei, &inv.ChainID, &created, &expires, &inv.Status, &inv.TxHash); e != nil {
+		var created, expires, updated string
+		if e = rows.Scan(&inv.ID, &inv.TelegramID, &inv.Address, &inv.PriceWei, &inv.ChainID, &created, &expires, &inv.StartBlock, &inv.Status, &inv.TxHash, &updated); e != nil {
 			return nil, 0, e
 		}
 		inv.CreatedAt, _ = time.Parse(time.RFC3339, created)
 		inv.ExpiresAt, _ = time.Parse(time.RFC3339, expires)
+		inv.UpdatedAt, _ = time.Parse(time.RFC3339, updated)
 		out = append(out, inv)
 	}
 	return out, total, rows.Err()
@@ -347,7 +382,7 @@ func (s *Store) MarkTelegramInvoicePaid(id, txHash string) error {
 		return e
 	}
 	defer tx.Rollback()
-	res, e := tx.Exec(`UPDATE telegram_invoices SET status='paid',tx_hash=? WHERE id=? AND status='pending'`, txHash, id)
+	res, e := tx.Exec(`UPDATE telegram_invoices SET status='paid',tx_hash=?,updated_at=? WHERE id=? AND status='pending'`, txHash, time.Now().UTC().Format(time.RFC3339), id)
 	if e != nil {
 		return e
 	}

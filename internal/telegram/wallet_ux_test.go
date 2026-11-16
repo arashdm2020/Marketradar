@@ -98,6 +98,10 @@ func TestRepeatedStartAlwaysSendsFreshMenuAndNeverEdits(t *testing.T) {
 	if sends != 2 || edits != 0 {
 		t.Fatalf("sendMessage=%d edits=%d; want one fresh send per /start and no edits", sends, edits)
 	}
+	joined := strings.Join(transport.bodies, "\n")
+	if !strings.Contains(joined, "Visitor") || !strings.Contains(joined, "1 از 1") {
+		t.Fatalf("menu does not show authoritative plan/quota: %s", joined)
+	}
 }
 
 func TestMenuCallbackStillEditsOriginatingMessage(t *testing.T) {
@@ -115,6 +119,70 @@ func TestMenuCallbackStillEditsOriginatingMessage(t *testing.T) {
 	}
 	if !strings.Contains(transport.bodies[1], `"message_id":87`) {
 		t.Fatalf("callback edit did not target originating message: %s", transport.bodies[1])
+	}
+}
+
+func TestHorizonKeyboardUsesCompatibilityPolicy(t *testing.T) {
+	s, e := profile.Open(t.TempDir() + "/horizon-menu.db")
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer s.DB.Close()
+	u, _ := s.Ensure(506)
+	u.Completed = true
+	u.State = "frame:XAU/USD"
+	_ = s.Save(u)
+	transport := &uxTransport{}
+	b := Bot{Store: s, Token: "test", HTTP: &http.Client{Transport: transport}}
+	b.handle(context.Background(), telegramUpdate(t, `{"callback_query":{"id":"frame1","data":"f:0","from":{"id":506},"message":{"message_id":90,"chat":{"id":506,"type":"private"}}}}`))
+	joined := strings.Join(transport.bodies, "\n")
+	if !strings.Contains(joined, `"callback_data":"y:scalp"`) || strings.Contains(joined, `"callback_data":"y:day"`) || strings.Contains(joined, `"callback_data":"y:swing"`) {
+		t.Fatalf("M1 horizon keyboard violates policy: %s", joined)
+	}
+}
+
+func TestStaleIncompatibleHorizonCallbackRejected(t *testing.T) {
+	s, e := profile.Open(t.TempDir() + "/stale-horizon.db")
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer s.DB.Close()
+	u, _ := s.Ensure(507)
+	u.Completed = true
+	u.State = "style:XAU/USD:1min"
+	_ = s.Save(u)
+	transport := &uxTransport{}
+	b := Bot{Store: s, Token: "test", HTTP: &http.Client{Transport: transport}}
+	b.handle(context.Background(), telegramUpdate(t, `{"callback_query":{"id":"h1","data":"y:swing","from":{"id":507},"message":{"message_id":91,"chat":{"id":507,"type":"private"}}}}`))
+	u, _ = s.Get(507)
+	if u.State != "style:XAU/USD:1min" {
+		t.Fatalf("invalid callback changed state to %s", u.State)
+	}
+	if !strings.Contains(strings.Join(transport.bodies, "\n"), "سازگار نیست") {
+		t.Fatal("clear invalid-selection message missing")
+	}
+}
+
+func TestChangingTimeframeClearsSelectedHorizon(t *testing.T) {
+	s, e := profile.Open(t.TempDir() + "/switch-frame.db")
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer s.DB.Close()
+	u, _ := s.Ensure(508)
+	u.Completed = true
+	u.State = "riskreview:XAU/USD:5min:scalp"
+	_ = s.Save(u)
+	transport := &uxTransport{}
+	b := Bot{Store: s, Token: "test", HTTP: &http.Client{Transport: transport}}
+	b.handle(context.Background(), telegramUpdate(t, `{"callback_query":{"id":"f2","data":"f:3","from":{"id":508},"message":{"message_id":92,"chat":{"id":508,"type":"private"}}}}`))
+	u, _ = s.Get(508)
+	if u.State != "style:XAU/USD:30min" {
+		t.Fatalf("old horizon was not invalidated: %s", u.State)
+	}
+	joined := strings.Join(transport.bodies, "\n")
+	if !strings.Contains(joined, `"callback_data":"y:day"`) || strings.Contains(joined, `"callback_data":"y:scalp"`) {
+		t.Fatalf("M30 options invalid: %s", joined)
 	}
 }
 
@@ -224,8 +292,15 @@ func TestPaymentPaginationIsIsolatedByUser(t *testing.T) {
 	_, _ = s.Ensure(601)
 	_, _ = s.Ensure(602)
 	for i := 0; i < 7; i++ {
-		if _, e = s.CreateTelegramInvoice(601, "0x1111111111111111111111111111111111111111", "1", 56, timeNowPlusHour()); e != nil {
+		var inv profile.TelegramInvoice
+		if inv, e = s.CreateTelegramInvoice(601, "0x1111111111111111111111111111111111111111", "1", 56, timeNowPlusHour()); e != nil {
 			t.Fatal(e)
+		}
+		if i < 6 {
+			_, e = s.DB.Exec(`UPDATE telegram_invoices SET status='expired' WHERE id=?`, inv.ID)
+			if e != nil {
+				t.Fatal(e)
+			}
 		}
 	}
 	if _, e = s.CreateTelegramInvoice(602, "0x2222222222222222222222222222222222222222", "2", 56, timeNowPlusHour()); e != nil {
