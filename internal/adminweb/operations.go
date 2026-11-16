@@ -194,29 +194,66 @@ func (s *Server) operationsWallets(w http.ResponseWriter, r *http.Request) {
 	if cfg, ce := treasury.LoadPublicConfig(s.Store.DB, opener); ce == nil {
 		chain = &bnb.RPC{URL: cfg.RPCURL, HTTP: &http.Client{Timeout: 4 * time.Second}}
 	}
-	rows, e := s.Store.DB.Query(`SELECT w.user_id,w.derivation_index,w.address,COALESCE((SELECT max(block_time) FROM web_payment_events p WHERE lower(p.address)=lower(w.address)),'') FROM web_wallets w ORDER BY w.user_id DESC LIMIT 100`)
+	rows, e := s.Store.DB.Query(`SELECT w.telegram_id,w.derivation_index,w.address,w.created_at,w.signable,COALESCE(l.web_user_id,0),COALESCE((SELECT max(block_time) FROM web_payment_events p WHERE lower(p.address)=lower(w.address)),'') FROM telegram_wallets w LEFT JOIN web_telegram_links l ON l.telegram_id=w.telegram_id ORDER BY w.derivation_index DESC LIMIT 200`)
 	if e != nil {
 		http.Error(w, "wallets unavailable", 500)
 		return
 	}
-	defer rows.Close()
+	type walletRow struct {
+		uid, idx, webID        int64
+		address, created, last string
+		signable               int
+	}
+	var saved []walletRow
+	for rows.Next() {
+		var x walletRow
+		if rows.Scan(&x.uid, &x.idx, &x.address, &x.created, &x.signable, &x.webID, &x.last) == nil {
+			saved = append(saved, x)
+		}
+	}
+	rows.Close()
 	out := []map[string]any{}
 	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
 	defer cancel()
-	for rows.Next() {
-		var uid, idx int64
-		var address, last string
-		if rows.Scan(&uid, &idx, &address, &last) == nil {
-			var balance any
-			if chain != nil && ctx.Err() == nil {
-				if n, be := chain.Balance(ctx, address); be == nil {
-					balance = n.String()
-				}
+	for _, x := range saved {
+		var balance any
+		if chain != nil && ctx.Err() == nil {
+			if n, be := chain.Balance(ctx, x.address); be == nil {
+				balance = n.String()
 			}
-			out = append(out, map[string]any{"user_id": uid, "index": idx, "address": address, "last_payment": last, "balance_wei": balance})
 		}
+		var invoiceCount, confirmed int
+		var reconcile, sweep string
+		_ = s.Store.DB.QueryRow(`SELECT count(*),sum(CASE WHEN status='paid' THEN 1 ELSE 0 END) FROM telegram_invoices WHERE telegram_id=?`, x.uid).Scan(&invoiceCount, &confirmed)
+		_ = s.Store.DB.QueryRow(`SELECT COALESCE(classification,'') FROM web_payment_events WHERE lower(address)=lower(?) ORDER BY block_time DESC LIMIT 1`, x.address).Scan(&reconcile)
+		_ = s.Store.DB.QueryRow(`SELECT COALESCE(status,'') FROM treasury_jobs WHERE lower(source)=lower(?) ORDER BY updated_at DESC LIMIT 1`, x.address).Scan(&sweep)
+		out = append(out, map[string]any{"telegram_id": x.uid, "web_user_id": x.webID, "index": x.idx, "address": x.address, "created_at": x.created, "signable": x.signable == 1, "last_payment": x.last, "balance_wei": balance, "invoice_count": invoiceCount, "confirmed_payments": confirmed, "reconciliation_status": reconcile, "sweep_status": sweep})
 	}
 	jsonOut(w, out)
+}
+func (s *Server) operationsWalletTransactions(w http.ResponseWriter, r *http.Request) {
+	if !s.guard(w, r) {
+		return
+	}
+	id, e := strconv.ParseInt(r.URL.Query().Get("telegram_id"), 10, 64)
+	if e != nil || id <= 0 {
+		http.Error(w, "invalid Telegram user", 400)
+		return
+	}
+	limit := 50
+	offset := 0
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		limit, _ = strconv.Atoi(raw)
+	}
+	if raw := r.URL.Query().Get("offset"); raw != "" {
+		offset, _ = strconv.Atoi(raw)
+	}
+	items, total, e := s.Store.WalletTransactions(id, limit, offset)
+	if e != nil {
+		http.Error(w, "wallet history unavailable", 404)
+		return
+	}
+	jsonOut(w, map[string]any{"items": items, "total": total, "limit": limit, "offset": offset})
 }
 func (s *Server) operationsAnalyses(w http.ResponseWriter, r *http.Request) {
 	if !s.guard(w, r) {

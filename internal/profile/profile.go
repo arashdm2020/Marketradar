@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"github.com/ethereum/go-ethereum/crypto"
 	_ "github.com/mattn/go-sqlite3"
+	"math/big"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -105,6 +106,13 @@ func (s *Store) EnsureWallet(telegramID int64, derive func(uint32) (string, erro
 		return "", e
 	}
 	defer tx.Rollback()
+	var verified int
+	if e = tx.QueryRow(`SELECT count(*) FROM users WHERE id=?`, telegramID).Scan(&verified); e != nil {
+		return "", e
+	}
+	if verified != 1 {
+		return "", errors.New("verified Telegram user required")
+	}
 	var existing string
 	if e = tx.QueryRow(`SELECT address FROM telegram_wallets WHERE telegram_id=?`, telegramID).Scan(&existing); e == nil {
 		return existing, tx.Commit()
@@ -113,7 +121,7 @@ func (s *Store) EnsureWallet(telegramID int64, derive func(uint32) (string, erro
 		return "", e
 	}
 	var next int64
-	if e = tx.QueryRow(`SELECT COALESCE(MAX(derivation_index),-1)+1 FROM telegram_wallets`).Scan(&next); e != nil {
+	if e = tx.QueryRow(`SELECT next_index FROM telegram_wallet_sequence WHERE id=1`).Scan(&next); e != nil {
 		return "", e
 	}
 	if next < 0 || next >= 1<<31 {
@@ -124,6 +132,9 @@ func (s *Store) EnsureWallet(telegramID int64, derive func(uint32) (string, erro
 		return "", e
 	}
 	if _, e = tx.Exec(`INSERT INTO telegram_wallets(telegram_id,derivation_index,address,created_at) VALUES(?,?,?,?)`, telegramID, next, addr, time.Now().UTC().Format(time.RFC3339)); e != nil {
+		return "", e
+	}
+	if _, e = tx.Exec(`UPDATE telegram_wallet_sequence SET next_index=? WHERE id=1 AND next_index=?`, next+1, next); e != nil {
 		return "", e
 	}
 	if e = tx.Commit(); e != nil {
@@ -147,13 +158,20 @@ func (s *Store) EnsureCustodialWallet(telegramID int64) (string, error) {
 		return "", e
 	}
 	defer tx.Rollback()
+	var verified int
+	if e = tx.QueryRow(`SELECT count(*) FROM users WHERE id=?`, telegramID).Scan(&verified); e != nil {
+		return "", e
+	}
+	if verified != 1 {
+		return "", errors.New("verified Telegram user required")
+	}
 	if e = tx.QueryRow(`SELECT address FROM telegram_wallets WHERE telegram_id=?`, telegramID).Scan(&address); e == nil {
 		return address, tx.Commit()
 	} else if e != sql.ErrNoRows {
 		return "", e
 	}
 	var next int64
-	if e = tx.QueryRow(`SELECT COALESCE(MAX(derivation_index),-1)+1 FROM telegram_wallets`).Scan(&next); e != nil {
+	if e = tx.QueryRow(`SELECT next_index FROM telegram_wallet_sequence WHERE id=1`).Scan(&next); e != nil {
 		return "", e
 	}
 	if next < 0 || next >= 1<<31 {
@@ -170,6 +188,9 @@ func (s *Store) EnsureCustodialWallet(telegramID int64) (string, error) {
 		return "", errors.New("wallet key/address verification failed")
 	}
 	if _, e = tx.Exec(`INSERT INTO telegram_wallets(telegram_id,derivation_index,address,created_at,private_key_hex,signable) VALUES(?,?,?,?,?,1)`, telegramID, next, address, time.Now().UTC().Format(time.RFC3339), privateHex); e != nil {
+		return "", e
+	}
+	if _, e = tx.Exec(`UPDATE telegram_wallet_sequence SET next_index=? WHERE id=1 AND next_index=?`, next+1, next); e != nil {
 		return "", e
 	}
 	if e = tx.Commit(); e != nil {
@@ -271,6 +292,13 @@ func (s *Store) WalletByAddress(address string) (int64, error) {
 	return id, e
 }
 func (s *Store) CreateTelegramInvoice(telegramID int64, address, priceWei string, chainID uint64, expiresAt time.Time, startBlocks ...uint64) (TelegramInvoice, error) {
+	amount, ok := new(big.Int).SetString(priceWei, 10)
+	if !ok || amount.Sign() <= 0 {
+		return TelegramInvoice{}, errors.New("invalid invoice amount")
+	}
+	if chainID != 56 {
+		return TelegramInvoice{}, errors.New("unsupported invoice network")
+	}
 	id := NewID()
 	if id == "" {
 		return TelegramInvoice{}, errors.New("random unavailable")
@@ -285,6 +313,13 @@ func (s *Store) CreateTelegramInvoice(telegramID int64, address, priceWei string
 		return TelegramInvoice{}, e
 	}
 	defer tx.Rollback()
+	var owned string
+	if e = tx.QueryRow(`SELECT address FROM telegram_wallets WHERE telegram_id=?`, telegramID).Scan(&owned); e != nil {
+		return TelegramInvoice{}, errors.New("wallet unavailable")
+	}
+	if !strings.EqualFold(owned, address) {
+		return TelegramInvoice{}, errors.New("invoice wallet ownership mismatch")
+	}
 	if _, e = tx.Exec(`UPDATE telegram_invoices SET status='expired',updated_at=? WHERE telegram_id=? AND status='pending' AND expires_at<=?`, now.Format(time.RFC3339), telegramID, now.Format(time.RFC3339)); e != nil {
 		return TelegramInvoice{}, e
 	}

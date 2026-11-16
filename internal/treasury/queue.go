@@ -72,7 +72,7 @@ func (w *Worker) DiscoverBalances(ctx context.Context) (int, error) {
 	queued := 0
 	for _, address := range addresses {
 		var active int
-		e = w.Store.DB.QueryRow(`SELECT count(*) FROM treasury_jobs WHERE source=? AND status IN ('queued','preparing','signed','broadcast','broadcast_unknown','needs_review','awaiting_destination')`, address).Scan(&active)
+		e = w.Store.DB.QueryRow(`SELECT count(*) FROM treasury_jobs WHERE source=? AND status IN ('queued','preparing','signed','broadcast','broadcast_unknown','insufficient_gas','needs_review','awaiting_destination','duplicate_hold')`, address).Scan(&active)
 		if e != nil {
 			return queued, e
 		}
@@ -97,7 +97,7 @@ func (w *Worker) DiscoverBalances(ctx context.Context) (int, error) {
 			tx.Rollback()
 			return queued, insertErr
 		}
-		result, insertErr := tx.Exec(`INSERT INTO treasury_jobs(payment_hash,source,amount_wei,destination_version,status,fee_wei,updated_at) SELECT ?,?,?,?,'queued',?,? WHERE NOT EXISTS (SELECT 1 FROM treasury_jobs WHERE source=? AND status IN ('queued','preparing','signed','broadcast','broadcast_unknown','needs_review','awaiting_destination'))`, jobID, strings.ToLower(address), balance.String(), dest.Version, fee.String(), now.Format(time.RFC3339), strings.ToLower(address))
+		result, insertErr := tx.Exec(`INSERT INTO treasury_jobs(payment_hash,source,amount_wei,destination_version,status,fee_wei,updated_at) SELECT ?,?,?,?,'queued',?,? WHERE NOT EXISTS (SELECT 1 FROM treasury_jobs WHERE source=? AND status IN ('queued','preparing','signed','broadcast','broadcast_unknown','insufficient_gas','needs_review','awaiting_destination','duplicate_hold'))`, jobID, strings.ToLower(address), balance.String(), dest.Version, fee.String(), now.Format(time.RFC3339), strings.ToLower(address))
 		if insertErr != nil {
 			tx.Rollback()
 			return queued, insertErr
@@ -132,10 +132,18 @@ func (w *Worker) Tick(ctx context.Context) error {
 	if e != nil {
 		return e
 	}
-	if j.Status == "queued" {
-		return w.prepare(ctx, j, id)
+	if j.Status == "queued" || j.Status == "insufficient_gas" {
+		e = w.prepare(ctx, j, id)
+		if e != nil {
+			_ = w.Store.RecordFailure(j.PaymentHash, false, e.Error())
+		}
+		return e
 	}
-	return w.reconcile(ctx, j)
+	e = w.reconcile(ctx, j)
+	if e != nil {
+		_ = w.Store.RecordFailure(j.PaymentHash, true, e.Error())
+	}
+	return e
 }
 func (w *Worker) prepare(ctx context.Context, j Job, chainID uint64) error {
 	dest, e := w.Store.ActiveDestination()
@@ -153,8 +161,8 @@ func (w *Worker) prepare(ctx context.Context, j Job, chainID uint64) error {
 	if other > 0 {
 		return nil
 	}
-	if j.Status == "queued" {
-		result, claimErr := w.Store.DB.Exec(`UPDATE treasury_jobs SET status='preparing',updated_at=? WHERE payment_hash=? AND status='queued'`, time.Now().UTC().Format(time.RFC3339), j.PaymentHash)
+	if j.Status == "queued" || j.Status == "insufficient_gas" {
+		result, claimErr := w.Store.DB.Exec(`UPDATE treasury_jobs SET status='preparing',updated_at=? WHERE payment_hash=? AND status IN ('queued','insufficient_gas')`, time.Now().UTC().Format(time.RFC3339), j.PaymentHash)
 		if claimErr != nil {
 			return claimErr
 		}
@@ -185,7 +193,8 @@ func (w *Worker) prepare(ctx context.Context, j Job, chainID uint64) error {
 	}
 	amount := available.Sub(available, fee)
 	if amount.Sign() <= 0 {
-		_, e = w.Store.DB.Exec(`UPDATE treasury_jobs SET status='needs_review',updated_at=? WHERE payment_hash=?`, time.Now().UTC().Format(time.RFC3339), j.PaymentHash)
+		now := time.Now().UTC()
+		_, e = w.Store.DB.Exec(`UPDATE treasury_jobs SET status='insufficient_gas',last_error='balance cannot cover gas',next_attempt_at=?,updated_at=? WHERE payment_hash=?`, now.Add(30*time.Second).Format(time.RFC3339), now.Format(time.RFC3339), j.PaymentHash)
 		return e
 	}
 	nonce, e := w.Chain.PendingNonce(ctx, j.Source)
@@ -199,8 +208,18 @@ func (w *Worker) prepare(ctx context.Context, j Job, chainID uint64) error {
 	if !strings.HasPrefix(signed.Raw, "0x") || len(signed.Hash) != 66 {
 		return errors.New("invalid signer response")
 	}
-	_, e = w.Store.DB.Exec(`UPDATE treasury_jobs SET status='signed',nonce=?,raw_tx=?,tx_hash=?,fee_wei=?,updated_at=? WHERE payment_hash=? AND status='preparing' AND destination_version=?`, nonce, signed.Raw, strings.ToLower(signed.Hash), fee.String(), time.Now().UTC().Format(time.RFC3339), j.PaymentHash, dest.Version)
-	return e
+	result, e := w.Store.DB.Exec(`UPDATE treasury_jobs SET status='signed',nonce=?,raw_tx=?,tx_hash=?,fee_wei=?,last_error='',next_attempt_at='',updated_at=? WHERE payment_hash=? AND status='preparing' AND destination_version=?`, nonce, signed.Raw, strings.ToLower(signed.Hash), fee.String(), time.Now().UTC().Format(time.RFC3339), j.PaymentHash, dest.Version)
+	if e != nil {
+		if strings.Contains(strings.ToLower(e.Error()), "unique") {
+			_, _ = w.Store.DB.Exec(`UPDATE treasury_jobs SET status='needs_review',last_error='nonce conflict',updated_at=? WHERE payment_hash=?`, time.Now().UTC().Format(time.RFC3339), j.PaymentHash)
+		}
+		return e
+	}
+	changed, _ := result.RowsAffected()
+	if changed != 1 {
+		return errors.New("treasury claim lost")
+	}
+	return nil
 }
 func (w *Worker) reconcile(ctx context.Context, j Job) error {
 	known, final, success, e := w.Chain.TxStatus(ctx, j.TxHash)
@@ -219,7 +238,11 @@ func (w *Worker) reconcile(ctx context.Context, j Job) error {
 			status = "broadcast_unknown"
 		}
 	}
-	_, saveErr := w.Store.DB.Exec(`UPDATE treasury_jobs SET status=?,updated_at=? WHERE payment_hash=? AND status IN ('signed','broadcast','broadcast_unknown')`, status, time.Now().UTC().Format(time.RFC3339), j.PaymentHash)
+	lastError := ""
+	if e != nil {
+		lastError = e.Error()
+	}
+	_, saveErr := w.Store.DB.Exec(`UPDATE treasury_jobs SET status=?,last_error=?,next_attempt_at='',updated_at=? WHERE payment_hash=? AND status IN ('signed','broadcast','broadcast_unknown')`, status, lastError, time.Now().UTC().Format(time.RFC3339), j.PaymentHash)
 	if saveErr != nil {
 		return saveErr
 	}

@@ -291,9 +291,11 @@ func TestPaymentPaginationIsIsolatedByUser(t *testing.T) {
 	defer s.DB.Close()
 	_, _ = s.Ensure(601)
 	_, _ = s.Ensure(602)
+	a601, _ := s.EnsureCustodialWallet(601)
+	a602, _ := s.EnsureCustodialWallet(602)
 	for i := 0; i < 7; i++ {
 		var inv profile.TelegramInvoice
-		if inv, e = s.CreateTelegramInvoice(601, "0x1111111111111111111111111111111111111111", "1", 56, timeNowPlusHour()); e != nil {
+		if inv, e = s.CreateTelegramInvoice(601, a601, "1", 56, timeNowPlusHour()); e != nil {
 			t.Fatal(e)
 		}
 		if i < 6 {
@@ -303,7 +305,7 @@ func TestPaymentPaginationIsIsolatedByUser(t *testing.T) {
 			}
 		}
 	}
-	if _, e = s.CreateTelegramInvoice(602, "0x2222222222222222222222222222222222222222", "2", 56, timeNowPlusHour()); e != nil {
+	if _, e = s.CreateTelegramInvoice(602, a602, "2", 56, timeNowPlusHour()); e != nil {
 		t.Fatal(e)
 	}
 	page, total, e := s.PageTelegramInvoices(601, 5, 0)
@@ -323,7 +325,8 @@ func TestPaymentTemplateUsesInvoiceEmoji(t *testing.T) {
 	}
 	defer s.DB.Close()
 	_, _ = s.Ensure(603)
-	if _, e = s.CreateTelegramInvoice(603, "0x3333333333333333333333333333333333333333", "1000000000000000", 56, timeNowPlusHour()); e != nil {
+	a603, _ := s.EnsureCustodialWallet(603)
+	if _, e = s.CreateTelegramInvoice(603, a603, "1000000000000000", 56, timeNowPlusHour()); e != nil {
 		t.Fatal(e)
 	}
 	transport := &uxTransport{}

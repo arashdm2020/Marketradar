@@ -71,7 +71,26 @@ func (s *Store) MigrateAccess() error {
 			return alterErr
 		}
 	}
-	return s.migrateFinancialCore()
+	if e = s.migrateFinancialCore(); e != nil {
+		return e
+	}
+	return s.migrateWalletCore()
+}
+
+func (s *Store) migrateWalletCore() error {
+	var done int
+	if e := s.DB.QueryRow(`SELECT count(*) FROM schema_version WHERE version=7`).Scan(&done); e != nil || done == 1 {
+		return e
+	}
+	tx, e := s.DB.Begin()
+	if e != nil {
+		return e
+	}
+	defer tx.Rollback()
+	if _, e = tx.Exec(`CREATE TABLE IF NOT EXISTS telegram_wallet_sequence(id INTEGER PRIMARY KEY CHECK(id=1),next_index INTEGER NOT NULL);INSERT OR IGNORE INTO telegram_wallet_sequence(id,next_index) SELECT 1,COALESCE(MAX(derivation_index),-1)+1 FROM telegram_wallets;UPDATE telegram_wallet_sequence SET next_index=MAX(next_index,(SELECT COALESCE(MAX(derivation_index),-1)+1 FROM telegram_wallets)) WHERE id=1;INSERT OR IGNORE INTO schema_version(version) VALUES(7)`); e != nil {
+		return e
+	}
+	return tx.Commit()
 }
 
 func (s *Store) migrateFinancialCore() error {

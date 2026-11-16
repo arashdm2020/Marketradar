@@ -75,6 +75,7 @@ func (s *Server) Handler() http.Handler {
 	m.HandleFunc("/api/operations/payments", s.operationsPayments)
 	m.HandleFunc("/api/operations/finance", s.operationsFinance)
 	m.HandleFunc("/api/operations/wallets", s.operationsWallets)
+	m.HandleFunc("/api/operations/wallet-transactions", s.operationsWalletTransactions)
 	m.HandleFunc("/api/operations/analyses", s.operationsAnalyses)
 	m.HandleFunc("/api/operations/system", s.operationsSystem)
 	m.HandleFunc("/api/operations/audit", s.operationsAudit)

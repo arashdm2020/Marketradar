@@ -1,13 +1,52 @@
 package profile
 
 import (
+	"database/sql"
 	"encoding/hex"
 	"sync"
 	"testing"
+	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 	"tradebot/internal/custody"
 )
+
+func TestLinkedWebIdentityReusesTelegramWalletAndLedger(t *testing.T) {
+	s, e := Open(t.TempDir() + "/linked.db")
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer s.DB.Close()
+	_, _ = s.Ensure(5150)
+	address, e := s.EnsureCustodialWallet(5150)
+	if e != nil {
+		t.Fatal(e)
+	}
+	_, e = s.DB.Exec(`CREATE TABLE web_users(id INTEGER PRIMARY KEY);CREATE TABLE web_telegram_links(telegram_id INTEGER PRIMARY KEY,web_user_id INTEGER UNIQUE);INSERT INTO web_users(id) VALUES(9);INSERT INTO web_telegram_links VALUES(5150,9)`)
+	if e != nil {
+		t.Fatal(e)
+	}
+	w, e := s.WalletRecordForWeb(9)
+	if e != nil || w.Address != address || w.TelegramID != 5150 {
+		t.Fatalf("wallet=%+v err=%v", w, e)
+	}
+	inv, e := s.CreateTelegramInvoice(5150, address, "100", 56, time.Now().Add(time.Hour), 10)
+	if e != nil {
+		t.Fatal(e)
+	}
+	_, e = s.DB.Exec(`CREATE TABLE IF NOT EXISTS web_payment_events(tx_hash TEXT PRIMARY KEY,invoice_id TEXT,address TEXT,amount_wei TEXT,block_time TEXT,classification TEXT,confirmation_count INTEGER);CREATE TABLE IF NOT EXISTS treasury_jobs(payment_hash TEXT PRIMARY KEY,status TEXT);INSERT INTO web_payment_events VALUES('0x1',?,?,'100','2026-01-01T00:00:00Z','paid_telegram',12);UPDATE telegram_invoices SET status='paid',tx_hash='0x1' WHERE id=?;INSERT INTO treasury_jobs VALUES('0x1','queued')`, inv.ID, address, inv.ID)
+	if e != nil {
+		t.Fatal(e)
+	}
+	items, total, e := s.WalletTransactions(5150, 10, 0)
+	if e != nil || total != 1 || len(items) != 1 || items[0].ReconciliationStatus != "paid_telegram" || items[0].SweepStatus != "queued" {
+		t.Fatalf("items=%+v total=%d err=%v", items, total, e)
+	}
+	_, e = s.WalletRecordForWeb(10)
+	if e != sql.ErrNoRows {
+		t.Fatalf("unlinked web identity err=%v", e)
+	}
+}
 
 func TestEnsureWalletIdempotent(t *testing.T) {
 	s, e := Open(t.TempDir() + "/wallet_test.db")
@@ -38,6 +77,7 @@ func TestEnsureWalletIdempotent(t *testing.T) {
 	}
 
 	// Different user gets different wallet
+	_, _ = s.Ensure(43)
 	addr3, e := s.EnsureWallet(43, derive)
 	if e != nil {
 		t.Fatal(e)
@@ -172,6 +212,7 @@ func TestAddressKeyConsistency(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
+	_, _ = s.Ensure(99)
 
 	addr, e := s.EnsureCustodialWallet(99)
 	if e != nil {

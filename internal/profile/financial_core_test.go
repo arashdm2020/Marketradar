@@ -13,13 +13,17 @@ func TestTelegramInvoiceLifecycleConcurrentAndRestartSafe(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, _ = s.Ensure(7001)
+	address, err := s.EnsureCustodialWallet(7001)
+	if err != nil {
+		t.Fatal(err)
+	}
 	var wg sync.WaitGroup
 	ids := make(chan string, 12)
 	for i := 0; i < 12; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			v, e := s.CreateTelegramInvoice(7001, "0x1111111111111111111111111111111111111111", "100", 56, time.Now().Add(time.Hour), 123)
+			v, e := s.CreateTelegramInvoice(7001, address, "100", 56, time.Now().Add(time.Hour), 123)
 			if e != nil {
 				t.Error(e)
 				return

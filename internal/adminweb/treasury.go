@@ -368,19 +368,33 @@ func (s *Server) treasurySweep(w http.ResponseWriter, r *http.Request) {
 	}
 	amount := new(big.Int).Sub(balance, fee)
 	txHash := "manual:" + address + ":" + fmt.Sprintf("%d", time.Now().UnixNano())
-	_, e = s.Treasury.DB.Exec(`INSERT OR IGNORE INTO web_payment_events(tx_hash,address,amount_wei,block_number,block_time,classification,seen_at) VALUES(?,?,?,0,?,'manual_sweep',?)`, txHash, address, amount.String(), time.Now().UTC().Format(time.RFC3339), time.Now().UTC().Format(time.RFC3339))
+	dbtx, e := s.Treasury.DB.Begin()
+	if e != nil {
+		http.Error(w, "sweep transaction unavailable", 500)
+		return
+	}
+	defer dbtx.Rollback()
+	_, e = dbtx.Exec(`INSERT INTO web_payment_events(tx_hash,address,amount_wei,block_number,block_time,classification,seen_at) VALUES(?,?,?,0,?,'manual_sweep',?)`, txHash, address, amount.String(), time.Now().UTC().Format(time.RFC3339), time.Now().UTC().Format(time.RFC3339))
 	if e != nil {
 		http.Error(w, "payment record failed", 500)
 		return
 	}
 	now := time.Now().UTC().Format(time.RFC3339)
-	_, e = s.Treasury.DB.Exec(`INSERT OR IGNORE INTO treasury_jobs(payment_hash,source,amount_wei,destination_version,status,fee_wei,updated_at) VALUES(?,?,?,?,'queued',?,?)`, txHash, address, amount.String(), dest.Version, fee.String(), now)
+	_, e = dbtx.Exec(`INSERT INTO treasury_jobs(payment_hash,source,amount_wei,destination_version,status,fee_wei,updated_at) VALUES(?,?,?,?,'queued',?,?)`, txHash, address, amount.String(), dest.Version, fee.String(), now)
 	if e != nil {
-		http.Error(w, "sweep job creation failed", 500)
+		if strings.Contains(strings.ToLower(e.Error()), "unique") {
+			http.Error(w, "wallet already has an active sweep", 409)
+		} else {
+			http.Error(w, "sweep job creation failed", 500)
+		}
 		return
 	}
-	if _, e = s.Store.DB.Exec(`INSERT INTO admin_audit(admin_id,target_id,action,detail,at_utc) VALUES(?,0,'manual_sweep',?,?)`, profile.AdminID, address, now); e != nil {
+	if _, e = dbtx.Exec(`INSERT INTO admin_audit(admin_id,target_id,action,detail,at_utc) VALUES(?,0,'manual_sweep',?,?)`, profile.AdminID, address, now); e != nil {
 		http.Error(w, "audit failed", 500)
+		return
+	}
+	if e = dbtx.Commit(); e != nil {
+		http.Error(w, "sweep commit failed", 500)
 		return
 	}
 	jsonOut(w, map[string]any{"ok": true, "payment_hash": txHash, "source": address, "destination": dest.Address, "amount_wei": amount.String(), "fee_wei": fee.String(), "status": "queued"})
@@ -443,7 +457,7 @@ func (s *Server) treasuryJobs(w http.ResponseWriter, r *http.Request) {
 	}
 	out := []map[string]any{}
 	for _, j := range jobs {
-		out = append(out, map[string]any{"payment_hash": j.PaymentHash, "source": j.Source, "amount_wei": j.AmountWei, "destination_version": j.DestinationVersion, "status": j.Status, "tx_hash": j.TxHash, "fee_wei": j.FeeWei, "updated_at": j.UpdatedAt})
+		out = append(out, map[string]any{"payment_hash": j.PaymentHash, "source": j.Source, "amount_wei": j.AmountWei, "destination_version": j.DestinationVersion, "status": j.Status, "tx_hash": j.TxHash, "fee_wei": j.FeeWei, "updated_at": j.UpdatedAt, "attempts": j.Attempts, "last_error": j.LastError})
 	}
 	jsonOut(w, out)
 }

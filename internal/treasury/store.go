@@ -31,6 +31,33 @@ type Job struct {
 	RawTx              string        `json:"-"`
 	FeeWei             string        `json:"-"`
 	UpdatedAt          string        `json:"updated_at"`
+	Attempts           int           `json:"attempts"`
+	LastError          string        `json:"last_error"`
+}
+
+func (s *Store) Migrate() error {
+	var done int
+	if e := s.DB.QueryRow(`SELECT count(*) FROM schema_version WHERE version=8`).Scan(&done); e != nil || done == 1 {
+		return e
+	}
+	tx, e := s.DB.Begin()
+	if e != nil {
+		return e
+	}
+	defer tx.Rollback()
+	for _, q := range []string{`ALTER TABLE treasury_jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0`, `ALTER TABLE treasury_jobs ADD COLUMN last_error TEXT NOT NULL DEFAULT ''`, `ALTER TABLE treasury_jobs ADD COLUMN next_attempt_at TEXT NOT NULL DEFAULT ''`} {
+		if _, e = tx.Exec(q); e != nil && !strings.Contains(strings.ToLower(e.Error()), "duplicate column name") {
+			return e
+		}
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	if _, e = tx.Exec(`UPDATE treasury_jobs SET status='duplicate_hold',last_error='duplicate active source quarantined; transaction state preserved',updated_at=? WHERE status IN ('queued','preparing','signed','broadcast','broadcast_unknown','insufficient_gas') AND rowid NOT IN (SELECT MIN(rowid) FROM treasury_jobs WHERE status IN ('queued','preparing','signed','broadcast','broadcast_unknown','insufficient_gas') GROUP BY lower(source))`, now); e != nil {
+		return e
+	}
+	if _, e = tx.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS treasury_one_active_source ON treasury_jobs(lower(source)) WHERE status IN ('queued','preparing','signed','broadcast','broadcast_unknown','insufficient_gas');INSERT OR IGNORE INTO schema_version(version) VALUES(8)`); e != nil {
+		return e
+	}
+	return tx.Commit()
 }
 
 const DefaultDestination = "0x0F65096f6C02aA6DC0d0b8c99dDeBbc3CD90B3F5"
@@ -38,6 +65,9 @@ const DefaultDestination = "0x0F65096f6C02aA6DC0d0b8c99dDeBbc3CD90B3F5"
 // SeedDestination installs the public receiving address only when no destination
 // has ever been configured. It never changes an administrator-selected value.
 func (s *Store) SeedDestination(address string) error {
+	if e := s.Migrate(); e != nil {
+		return e
+	}
 	if !ValidAddress(address) {
 		return errors.New("invalid default destination")
 	}
@@ -85,6 +115,9 @@ func (s *Store) ActiveDestination() (Destination, error) {
 	return d, e
 }
 func (s *Store) SetDestination(admin int64, code, address string) (Destination, error) {
+	if e := s.Migrate(); e != nil {
+		return Destination{}, e
+	}
 	if admin != profile.AdminID || !ValidAddress(address) {
 		return Destination{}, errors.New("invalid destination or admin")
 	}
@@ -106,7 +139,7 @@ func (s *Store) SetDestination(admin int64, code, address string) (Destination, 
 		return Destination{}, e
 	}
 	id, _ := r.LastInsertId()
-	if _, e = tx.Exec(`UPDATE treasury_jobs SET status='needs_review',updated_at=? WHERE status IN ('queued','awaiting_destination')`, now); e != nil {
+	if _, e = tx.Exec(`UPDATE treasury_jobs SET status='needs_review',updated_at=? WHERE status IN ('queued','awaiting_destination','insufficient_gas')`, now); e != nil {
 		return Destination{}, e
 	}
 	if _, e = tx.Exec(`INSERT INTO admin_audit(admin_id,action,detail,at_utc) VALUES(?,'treasury_destination',?,?)`, admin, fmt.Sprintf("version=%d", id), now); e != nil {
@@ -119,11 +152,11 @@ func (s *Store) SetDestination(admin int64, code, address string) (Destination, 
 }
 func (s *Store) Job(hash string) (Job, error) {
 	var j Job
-	e := s.DB.QueryRow(`SELECT payment_hash,source,amount_wei,destination_version,status,nonce,tx_hash,raw_tx,fee_wei FROM treasury_jobs WHERE payment_hash=?`, strings.ToLower(hash)).Scan(&j.PaymentHash, &j.Source, &j.AmountWei, &j.DestinationVersion, &j.Status, &j.Nonce, &j.TxHash, &j.RawTx, &j.FeeWei)
+	e := s.DB.QueryRow(`SELECT payment_hash,source,amount_wei,destination_version,status,nonce,tx_hash,raw_tx,fee_wei,attempts,last_error FROM treasury_jobs WHERE payment_hash=?`, strings.ToLower(hash)).Scan(&j.PaymentHash, &j.Source, &j.AmountWei, &j.DestinationVersion, &j.Status, &j.Nonce, &j.TxHash, &j.RawTx, &j.FeeWei, &j.Attempts, &j.LastError)
 	return j, e
 }
 func (s *Store) Jobs() ([]Job, error) {
-	rows, e := s.DB.Query(`SELECT payment_hash,source,amount_wei,destination_version,status,nonce,tx_hash,raw_tx,fee_wei,updated_at FROM treasury_jobs ORDER BY updated_at DESC LIMIT 200`)
+	rows, e := s.DB.Query(`SELECT payment_hash,source,amount_wei,destination_version,status,nonce,tx_hash,raw_tx,fee_wei,updated_at,attempts,last_error FROM treasury_jobs ORDER BY updated_at DESC LIMIT 200`)
 	if e != nil {
 		return nil, e
 	}
@@ -132,7 +165,7 @@ func (s *Store) Jobs() ([]Job, error) {
 	for rows.Next() {
 		var j Job
 		var updated string
-		if e = rows.Scan(&j.PaymentHash, &j.Source, &j.AmountWei, &j.DestinationVersion, &j.Status, &j.Nonce, &j.TxHash, &j.RawTx, &j.FeeWei, &updated); e != nil {
+		if e = rows.Scan(&j.PaymentHash, &j.Source, &j.AmountWei, &j.DestinationVersion, &j.Status, &j.Nonce, &j.TxHash, &j.RawTx, &j.FeeWei, &updated, &j.Attempts, &j.LastError); e != nil {
 			return nil, e
 		}
 		j.UpdatedAt = updated
@@ -142,7 +175,7 @@ func (s *Store) Jobs() ([]Job, error) {
 }
 func (s *Store) NextJob() (Job, error) {
 	var j Job
-	e := s.DB.QueryRow(`SELECT payment_hash,source,amount_wei,destination_version,status,nonce,tx_hash,raw_tx,fee_wei FROM treasury_jobs WHERE status IN ('broadcast_unknown','signed','broadcast','queued') ORDER BY CASE status WHEN 'broadcast_unknown' THEN 0 WHEN 'signed' THEN 1 WHEN 'broadcast' THEN 2 ELSE 3 END,updated_at LIMIT 1`).Scan(&j.PaymentHash, &j.Source, &j.AmountWei, &j.DestinationVersion, &j.Status, &j.Nonce, &j.TxHash, &j.RawTx, &j.FeeWei)
+	e := s.DB.QueryRow(`SELECT payment_hash,source,amount_wei,destination_version,status,nonce,tx_hash,raw_tx,fee_wei,attempts,last_error FROM treasury_jobs WHERE status IN ('broadcast_unknown','signed','broadcast','queued','insufficient_gas') AND (next_attempt_at='' OR next_attempt_at<=?) ORDER BY CASE status WHEN 'broadcast_unknown' THEN 0 WHEN 'signed' THEN 1 WHEN 'broadcast' THEN 2 WHEN 'queued' THEN 3 ELSE 4 END,updated_at LIMIT 1`, time.Now().UTC().Format(time.RFC3339)).Scan(&j.PaymentHash, &j.Source, &j.AmountWei, &j.DestinationVersion, &j.Status, &j.Nonce, &j.TxHash, &j.RawTx, &j.FeeWei, &j.Attempts, &j.LastError)
 	return j, e
 }
 func (s *Store) Counts() (map[string]int, error) {
@@ -200,7 +233,29 @@ func (s *Store) Amounts() (map[string]string, error) {
 	return out, rows.Err()
 }
 func (s *Store) Recover() error {
-	_, e := s.DB.Exec(`UPDATE treasury_jobs SET status='needs_review',updated_at=? WHERE status='preparing'`, time.Now().UTC().Format(time.RFC3339))
+	if e := s.Migrate(); e != nil {
+		return e
+	}
+	_, e := s.DB.Exec(`UPDATE treasury_jobs SET status='queued',last_error='recovered after restart before signing',next_attempt_at='',updated_at=? WHERE status='preparing' AND raw_tx='';UPDATE treasury_jobs SET status='signed',last_error='recovered signed transaction',next_attempt_at='',updated_at=? WHERE status='preparing' AND raw_tx!=''`, time.Now().UTC().Format(time.RFC3339), time.Now().UTC().Format(time.RFC3339))
+	return e
+}
+
+func (s *Store) RecordFailure(hash string, retainStatus bool, detail string) error {
+	if len(detail) > 300 {
+		detail = detail[:300]
+	}
+	var attempts int
+	_ = s.DB.QueryRow(`SELECT attempts FROM treasury_jobs WHERE payment_hash=?`, strings.ToLower(hash)).Scan(&attempts)
+	statusExpr := "'queued'"
+	if retainStatus {
+		statusExpr = "status"
+	} else if attempts >= 7 {
+		statusExpr = "'needs_review'"
+	}
+	q := `UPDATE treasury_jobs SET status=` + statusExpr + `,attempts=attempts+1,last_error=?,next_attempt_at=?,updated_at=? WHERE payment_hash=?`
+	now := time.Now().UTC()
+	delay := time.Duration(1<<min(6, attempts+1)) * time.Second
+	_, e := s.DB.Exec(q, detail, now.Add(delay).Format(time.RFC3339), now.Format(time.RFC3339), strings.ToLower(hash))
 	return e
 }
 func (s *Store) Review(admin int64, hash string) error {
