@@ -268,6 +268,7 @@ func TestDestinationReviewQueueRecoveryAndNoDoubleSweep(t *testing.T) {
 }
 
 func TestBalanceDiscoveryQueuesEachWalletOnce(t *testing.T) {
+	t.Setenv("WALLET_KEY_ENCRYPTION_KEY", strings.Repeat("18", 32))
 	p, e := profile.Open(t.TempDir() + "/discovery.db")
 	if e != nil {
 		t.Fatal(e)

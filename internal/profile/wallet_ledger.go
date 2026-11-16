@@ -38,6 +38,7 @@ func (s *Store) WalletRecordForWeb(webUserID int64) (WalletRecord, error) {
 	}
 	return s.WalletRecordForTelegram(telegramID)
 }
+func (s *Store) TelegramForWebUser(webUserID int64)(int64,error){var id int64;e:=s.DB.QueryRow(`SELECT telegram_id FROM web_telegram_links WHERE web_user_id=?`,webUserID).Scan(&id);return id,e}
 
 func (s *Store) WalletTransactions(telegramID int64, limit, offset int) ([]WalletTransaction, int, error) {
 	if limit < 1 || limit > 100 || offset < 0 {

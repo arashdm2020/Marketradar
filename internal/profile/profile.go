@@ -2,10 +2,8 @@ package profile
 
 import (
 	"database/sql"
-	"encoding/hex"
 	"errors"
 	"fmt"
-	"github.com/ethereum/go-ethereum/crypto"
 	_ "github.com/mattn/go-sqlite3"
 	"math/big"
 	"os"
@@ -13,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"tradebot/internal/custody"
 )
 
 type User struct {
@@ -64,7 +63,7 @@ func Open(path string) (*Store, error) {
 	for _, stmt := range []string{"ALTER TABLE alerts ADD COLUMN entry REAL NOT NULL DEFAULT 0", "ALTER TABLE alerts ADD COLUMN stage INTEGER NOT NULL DEFAULT 0", "ALTER TABLE alerts ADD COLUMN expires_utc TEXT NOT NULL DEFAULT ''"} {
 		_, _ = db.Exec(stmt)
 	}
-	for _, stmt := range []string{"ALTER TABLE telegram_wallets ADD COLUMN private_key_hex TEXT NOT NULL DEFAULT ''", "ALTER TABLE telegram_wallets ADD COLUMN signable INTEGER NOT NULL DEFAULT 0"} {
+	for _, stmt := range []string{"ALTER TABLE telegram_wallets ADD COLUMN private_key_hex TEXT NOT NULL DEFAULT ''", "ALTER TABLE telegram_wallets ADD COLUMN signable INTEGER NOT NULL DEFAULT 0", "ALTER TABLE telegram_wallets ADD COLUMN private_key_cipher BLOB NOT NULL DEFAULT X''", "ALTER TABLE telegram_wallets ADD COLUMN key_encryption_version INTEGER NOT NULL DEFAULT 0"} {
 		_, _ = db.Exec(stmt)
 	}
 	if e := (&Store{db}).MigrateAccess(); e != nil {
@@ -153,50 +152,11 @@ func (s *Store) EnsureCustodialWallet(telegramID int64) (string, error) {
 	} else if e != sql.ErrNoRows {
 		return "", e
 	}
-	tx, e := s.DB.Begin()
+	secure, e := custody.New(s.DB)
 	if e != nil {
 		return "", e
 	}
-	defer tx.Rollback()
-	var verified int
-	if e = tx.QueryRow(`SELECT count(*) FROM users WHERE id=?`, telegramID).Scan(&verified); e != nil {
-		return "", e
-	}
-	if verified != 1 {
-		return "", errors.New("verified Telegram user required")
-	}
-	if e = tx.QueryRow(`SELECT address FROM telegram_wallets WHERE telegram_id=?`, telegramID).Scan(&address); e == nil {
-		return address, tx.Commit()
-	} else if e != sql.ErrNoRows {
-		return "", e
-	}
-	var next int64
-	if e = tx.QueryRow(`SELECT next_index FROM telegram_wallet_sequence WHERE id=1`).Scan(&next); e != nil {
-		return "", e
-	}
-	if next < 0 || next >= 1<<31 {
-		return "", errors.New("wallet index exhausted")
-	}
-	key, e := crypto.GenerateKey()
-	if e != nil {
-		return "", e
-	}
-	privateHex := hex.EncodeToString(crypto.FromECDSA(key))
-	address = strings.ToLower(crypto.PubkeyToAddress(key.PublicKey).Hex())
-	verify, e := crypto.HexToECDSA(privateHex)
-	if e != nil || !strings.EqualFold(crypto.PubkeyToAddress(verify.PublicKey).Hex(), address) {
-		return "", errors.New("wallet key/address verification failed")
-	}
-	if _, e = tx.Exec(`INSERT INTO telegram_wallets(telegram_id,derivation_index,address,created_at,private_key_hex,signable) VALUES(?,?,?,?,?,1)`, telegramID, next, address, time.Now().UTC().Format(time.RFC3339), privateHex); e != nil {
-		return "", e
-	}
-	if _, e = tx.Exec(`UPDATE telegram_wallet_sequence SET next_index=? WHERE id=1 AND next_index=?`, next+1, next); e != nil {
-		return "", e
-	}
-	if e = tx.Commit(); e != nil {
-		return "", e
-	}
-	return address, nil
+	return secure.EnsureWallet(telegramID)
 }
 func (s *Store) Save(u User) error {
 	if u.MinProfit < 0 || u.MaxProfit < 0 || u.MaxRisk < 0 || u.MaxRisk > 100 {

@@ -72,6 +72,30 @@ func ValidateCombination(frame Timeframe, horizon string) error {
 	return nil
 }
 
+// PredictionCandles converts the selected holding horizon into an actual
+// forward-candle budget while retaining the administrator's intraday base.
+func PredictionCandles(h Horizon, intradayBase int) int {
+	if intradayBase < 1 {
+		intradayBase = 12
+	}
+	v := intradayBase
+	switch h {
+	case HorizonScalp:
+		v = (intradayBase + 1) / 2
+	case HorizonSwing:
+		v = intradayBase * 2
+	case HorizonPosition:
+		v = intradayBase * 4
+	}
+	if v < 1 {
+		return 1
+	}
+	if v > 96 {
+		return 96
+	}
+	return v
+}
+
 func ParseFrame(s string) (Timeframe, error) {
 	for _, f := range Frames {
 		if string(f) == s {

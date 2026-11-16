@@ -118,6 +118,7 @@ func (w *AsyncWorker) Enqueue(ctx context.Context, req AnalysisRequest) (bool, e
 	if !access.Policy.Allows(req.Symbol, req.Timeframe, horizon) {
 		return false, errors.New("analysis selection is not allowed by entitlement policy")
 	}
+	req.HorizonCandles = catalog.PredictionCandles(horizon, req.HorizonCandles)
 	w.inflightMu.Lock()
 	if _, exists := w.inflight[req.UserID]; exists {
 		w.inflightMu.Unlock()

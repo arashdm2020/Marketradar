@@ -601,7 +601,8 @@ func (b Bot) handle(ctx context.Context, x update) {
 		req.ConfigVersion = cfg.Version
 		req.ModelCandles = cfg.ModelCandles
 		req.EngineCandles = cfg.EngineCandles
-		req.HorizonCandles = cfg.HorizonCandles
+		selectedHorizon, _ := catalog.ParseHorizon(req.Style)
+		req.HorizonCandles = catalog.PredictionCandles(selectedHorizon, cfg.HorizonCandles)
 		req.MaxDurationSeconds = cfg.MaxDurationSeconds
 		req.ResponseTokenBudget = cfg.ResponseTokenBudget
 		if _, e := b.Worker.Enqueue(ctx, req); e != nil {
@@ -936,7 +937,11 @@ func (b Bot) createWallet(ctx context.Context, chat, id int64) {
 		_ = b.screen(ctx, chat, "<b>"+customEmoji(EmojiBNB)+" ساخت کیف‌پول</b>\n\n"+customEmoji(EmojiAttention)+" سرویس نگهداری کیف‌پول در دسترس نیست.", [][]map[string]any{{button("🏠 منوی اصلی", "menu")}})
 		return
 	}
-	address, e := b.Store.EnsureCustodialWallet(id)
+	if b.Custody == nil {
+		_ = b.screen(ctx, chat, "<b>ساخت کیف‌پول</b>\n\n❌ سرویس امن نگهداری کلید در دسترس نیست.", [][]map[string]any{{button("🏠 خانه", "menu")}})
+		return
+	}
+	address, e := b.Custody.EnsureWallet(id)
 	if e != nil {
 		_ = b.screen(ctx, chat, "<b>"+customEmoji(EmojiBNB)+" ساخت کیف‌پول</b>\n\n"+customEmoji(EmojiFailure)+" ساخت کیف‌پول انجام نشد. دوباره تلاش کنید.", [][]map[string]any{{button("تلاش دوباره", "wallet:create"), button("🏠 خانه", "menu")}})
 		return

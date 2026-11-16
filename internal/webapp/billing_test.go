@@ -138,6 +138,7 @@ func addPayment(c *fakeChain, n uint64, at time.Time, to, amount string, txID in
 }
 
 func TestTelegramInvoiceSettlementIsIdempotent(t *testing.T) {
+	t.Setenv("WALLET_KEY_ENCRYPTION_KEY", strings.Repeat("15", 32))
 	p, s := testStores(t)
 	defer p.DB.Close()
 	_, e := p.Ensure(9001)
@@ -191,10 +192,23 @@ func (fakeAnalyzer) Analyze(_ context.Context, r engine.Request) (domain.Decisio
 }
 
 func TestInvoiceSettlementAndWebAnalysis(t *testing.T) {
+	t.Setenv("WALLET_KEY_ENCRYPTION_KEY", strings.Repeat("22", 32))
 	p, s := testStores(t)
 	defer p.DB.Close()
 	user, e := s.Register("user@example.com", "very-long-password-123")
 	if e != nil {
+		t.Fatal(e)
+	}
+	tgID, _ := p.Ensure(9002)
+	_ = tgID
+	if _, e = p.WalletRecordForWeb(user); e == nil {
+		t.Fatal("unlinked web user unexpectedly had shared wallet")
+	}
+	linkToken, _ := p.IssueWebLink(9002, time.Now())
+	if e = p.ConsumeWebLink(linkToken, user, time.Now()); e != nil {
+		t.Fatal(e)
+	}
+	if e = p.ActivateOnce(9002, "seed-web-plan", "test", time.Now().Add(-time.Hour)); e != nil {
 		t.Fatal(e)
 	}
 	if e = s.SetPrice(profile.AdminID, "0.01"); e != nil {
@@ -211,9 +225,6 @@ func TestInvoiceSettlementAndWebAnalysis(t *testing.T) {
 	}
 	if inv.ChainID != 97 || inv.PriceWei != "10000000000000000" || inv.ExpiresAt.Sub(inv.CreatedAt) != 15*time.Minute {
 		t.Fatalf("bad invoice: %+v", inv)
-	}
-	if _, e = (&AnalysisService{Store: s, Config: p, Engine: fakeAnalyzer{}}).Submit(user, "XAU/USD", "5min", "day"); e == nil {
-		t.Fatal("analysis before payment accepted")
 	}
 	addPayment(chain, 101, now.Add(2*time.Minute), inv.Address, "0x2386f26fc10000", 1)
 	chain.head = 112

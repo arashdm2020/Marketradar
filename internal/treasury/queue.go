@@ -53,7 +53,7 @@ func (w *Worker) DiscoverBalances(ctx context.Context) (int, error) {
 		return 0, errors.New("invalid gas price")
 	}
 	fee := new(big.Int).Mul(gasPrice, big.NewInt(21000))
-	rows, e := w.Store.DB.Query(`SELECT address FROM telegram_wallets WHERE signable=1 AND private_key_hex!='' ORDER BY derivation_index`)
+	rows, e := w.Store.DB.Query(`SELECT address FROM telegram_wallets WHERE signable=1 AND length(private_key_cipher)>0 AND key_encryption_version=1 ORDER BY derivation_index`)
 	if e != nil {
 		return 0, e
 	}

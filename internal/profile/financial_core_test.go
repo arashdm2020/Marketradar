@@ -1,12 +1,14 @@
 package profile
 
 import (
+	"strings"
 	"sync"
 	"testing"
 	"time"
 )
 
 func TestTelegramInvoiceLifecycleConcurrentAndRestartSafe(t *testing.T) {
+	t.Setenv("WALLET_KEY_ENCRYPTION_KEY", strings.Repeat("14", 32))
 	path := t.TempDir() + "/financial.db"
 	s, err := Open(path)
 	if err != nil {

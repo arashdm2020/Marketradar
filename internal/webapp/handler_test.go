@@ -13,8 +13,11 @@ import (
 )
 
 func TestBrowserFlowInvoiceToAnalysis(t *testing.T) {
+	t.Setenv("WALLET_KEY_ENCRYPTION_KEY", strings.Repeat("23", 32))
 	p, s := testStores(t)
 	defer p.DB.Close()
+	tgID := int64(78001)
+	_, _ = p.Ensure(tgID)
 	chain := &fakeChain{head: 300, chainID: 97, blocks: map[uint64]bnb.Block{}, receipts: map[string]bnb.Receipt{}}
 	billing := &Billing{Store: s, Deriver: testDeriver(t), Chain: chain, ExpectedChainID: 97, Confirmations: 2, ReferenceVerified: true}
 	billing.TestInvoicesEnabled = true
@@ -37,6 +40,11 @@ func TestBrowserFlowInvoiceToAnalysis(t *testing.T) {
 		t.Fatalf("register %d", register.Code)
 	}
 	cookie := register.Result().Cookies()[0].String()
+	webID, _ := s.Session(register.Result().Cookies()[0].Value)
+	token, _ := p.IssueWebLink(tgID, time.Now())
+	if e := p.ConsumeWebLink(token, webID, time.Now()); e != nil {
+		t.Fatal(e)
+	}
 	if w := post("/app/api/invoice", url.Values{}, cookie); w.Code != 503 {
 		t.Fatalf("invoice allowed before price %d", w.Code)
 	}

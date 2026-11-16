@@ -187,6 +187,7 @@ func TestChangingTimeframeClearsSelectedHorizon(t *testing.T) {
 }
 
 func TestExplicitWalletCreationIsIdempotentAndOffersCopy(t *testing.T) {
+	t.Setenv("WALLET_KEY_ENCRYPTION_KEY", strings.Repeat("21",32))
 	s, e := profile.Open(t.TempDir() + "/wallet.db")
 	if e != nil {
 		t.Fatal(e)
@@ -284,6 +285,7 @@ func TestSendAndEditPreserveCustomEmojiHTML(t *testing.T) {
 }
 
 func TestPaymentPaginationIsIsolatedByUser(t *testing.T) {
+	t.Setenv("WALLET_KEY_ENCRYPTION_KEY", strings.Repeat("16", 32))
 	s, e := profile.Open(t.TempDir() + "/payments.db")
 	if e != nil {
 		t.Fatal(e)
@@ -319,6 +321,7 @@ func TestPaymentPaginationIsIsolatedByUser(t *testing.T) {
 }
 
 func TestPaymentTemplateUsesInvoiceEmoji(t *testing.T) {
+	t.Setenv("WALLET_KEY_ENCRYPTION_KEY", strings.Repeat("17", 32))
 	s, e := profile.Open(t.TempDir() + "/payment-template.db")
 	if e != nil {
 		t.Fatal(e)

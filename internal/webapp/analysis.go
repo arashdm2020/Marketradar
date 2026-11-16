@@ -37,12 +37,9 @@ type AnalysisRecord struct {
 }
 
 func (s *AnalysisService) Submit(user int64, symbol, frame, style string) (string, error) {
-	until, e := s.Store.Subscription(user)
+	telegramID, e := s.Config.TelegramForWebUser(user)
 	if e != nil {
-		return "", e
-	}
-	if !until.After(time.Now()) {
-		return "", errors.New("active web subscription required")
+		return "", errors.New("verified Telegram link required")
 	}
 	inst, ok := catalog.Find(symbol)
 	if !ok || !inst.Enabled {
@@ -55,28 +52,44 @@ func (s *AnalysisService) Submit(user int64, symbol, frame, style string) (strin
 	if e = catalog.ValidateCombination(tf, style); e != nil {
 		return "", e
 	}
+	horizon, e := catalog.ParseHorizon(style)
+	if e != nil {
+		return "", e
+	}
+	access, e := s.Config.Access(telegramID, time.Now())
+	if e != nil {
+		return "", e
+	}
+	if !access.Policy.Allows(symbol, tf, horizon) {
+		return "", errors.New("analysis selection is not allowed by entitlement policy")
+	}
 	cfg, e := s.Config.ActiveConfig()
 	if e != nil {
 		return "", e
 	}
+	cfg.HorizonCandles = catalog.PredictionCandles(horizon, cfg.HorizonCandles)
 	id := profile.NewID()
 	if id == "" {
 		return "", errors.New("random unavailable")
+	}
+	if e = s.Config.Reserve(id, telegramID, time.Now()); e != nil {
+		return "", e
 	}
 	now := time.Now().UTC().Format(time.RFC3339)
 	_, _ = s.Store.DB.Exec(`UPDATE web_analyses SET status='analysis_unavailable',error='درخواست قبلی پس از توقف سرویس تکمیل نشد.' WHERE user_id=? AND status IN ('queued','running') AND updated_at<?`, user, time.Now().UTC().Add(-5*time.Minute).Format(time.RFC3339))
 	_, e = s.Store.DB.Exec(`INSERT INTO web_analyses(id,user_id,symbol,timeframe,style,status,config_version,horizon_candles,created_at,updated_at) VALUES(?,?,?,?,?,'queued',?,?,?,?)`, id, user, symbol, frame, style, cfg.Version, cfg.HorizonCandles, now, now)
 	if e != nil {
+		_ = s.Config.SetUse(id, "released")
 		return "", errors.New("analysis already running")
 	}
 	ctx := s.Context
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	go s.run(ctx, id, user, symbol, tf, style, cfg)
+	go s.run(ctx, id, user, telegramID, symbol, tf, style, cfg)
 	return id, nil
 }
-func (s *AnalysisService) run(parent context.Context, id string, user int64, symbol string, frame catalog.Timeframe, style string, cfg profile.AnalysisConfig) {
+func (s *AnalysisService) run(parent context.Context, id string, user, _ int64, symbol string, frame catalog.Timeframe, style string, cfg profile.AnalysisConfig) {
 	timeout := time.Duration(cfg.MaxDurationSeconds) * time.Second
 	if timeout < 30*time.Second || timeout > 10*time.Minute {
 		timeout = 4 * time.Minute
@@ -91,6 +104,11 @@ func (s *AnalysisService) run(parent context.Context, id string, user int64, sym
 	if e != nil || d.Final == "ANALYSIS_UNAVAILABLE" {
 		status = "analysis_unavailable"
 		reason = "تحلیل به دلیل خطای فنی یا دادهٔ بازار تکمیل نشد."
+	}
+	if status == "completed" {
+		_ = s.Config.SetUse(id, "consumed")
+	} else {
+		_ = s.Config.SetUse(id, "released")
 	}
 	raw, _ := json.Marshal(d)
 	n := len(d.Snapshot.Candles)

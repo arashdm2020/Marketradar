@@ -3,6 +3,7 @@ package profile
 import (
 	"database/sql"
 	"encoding/hex"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -12,6 +13,7 @@ import (
 )
 
 func TestLinkedWebIdentityReusesTelegramWalletAndLedger(t *testing.T) {
+	t.Setenv("WALLET_KEY_ENCRYPTION_KEY", strings.Repeat("11", 32))
 	s, e := Open(t.TempDir() + "/linked.db")
 	if e != nil {
 		t.Fatal(e)
@@ -159,6 +161,7 @@ func TestConcurrentEnsureWallet(t *testing.T) {
 }
 
 func TestConcurrentEnsureCustodialWallet(t *testing.T) {
+	t.Setenv("WALLET_KEY_ENCRYPTION_KEY", strings.Repeat("12", 32))
 	s, e := Open(t.TempDir() + "/custodial_concurrent.db")
 	if e != nil {
 		t.Fatal(e)
@@ -202,6 +205,7 @@ func TestConcurrentEnsureCustodialWallet(t *testing.T) {
 }
 
 func TestAddressKeyConsistency(t *testing.T) {
+	t.Setenv("WALLET_KEY_ENCRYPTION_KEY", strings.Repeat("13", 32))
 	s, e := Open(t.TempDir() + "/key_consistency_test.db")
 	if e != nil {
 		t.Fatal(e)

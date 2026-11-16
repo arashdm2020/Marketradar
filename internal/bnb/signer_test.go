@@ -13,6 +13,7 @@ import (
 )
 
 func newTestCustodyStore(t *testing.T) *custody.Store {
+	t.Setenv("WALLET_KEY_ENCRYPTION_KEY", strings.Repeat("19", 32))
 	db, err := sql.Open("sqlite3", ":memory:")
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)

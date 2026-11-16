@@ -287,7 +287,7 @@ func run() error {
 			}
 		}
 		var walletTotal, walletSignable int
-		_ = store.DB.QueryRow(`SELECT count(*),COALESCE(sum(CASE WHEN signable=1 AND private_key_hex!='' THEN 1 ELSE 0 END),0) FROM telegram_wallets`).Scan(&walletTotal, &walletSignable)
+		_ = store.DB.QueryRow(`SELECT count(*),COALESCE(sum(CASE WHEN signable=1 AND length(private_key_cipher)>0 AND key_encryption_version=1 THEN 1 ELSE 0 END),0) FROM telegram_wallets`).Scan(&walletTotal, &walletSignable)
 		slog.Info("telegram_wallet_compatibility", "total", walletTotal, "signable", walletSignable, "non_signable", walletTotal-walletSignable)
 		signer := bnb.NewCustodialSigner(cust)
 		var sweepWorker *treasury.Worker
