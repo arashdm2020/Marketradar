@@ -63,13 +63,19 @@ type update struct {
 			Type string `json:"type"`
 		} `json:"chat"`
 		From struct {
-			ID int64 `json:"id"`
+			ID        int64  `json:"id"`
+			FirstName string `json:"first_name"`
+			LastName  string `json:"last_name"`
+			Username  string `json:"username"`
 		} `json:"from"`
 	} `json:"message"`
 	Callback *struct {
 		ID, Data string
 		From     struct {
-			ID int64 `json:"id"`
+			ID        int64  `json:"id"`
+			FirstName string `json:"first_name"`
+			LastName  string `json:"last_name"`
+			Username  string `json:"username"`
 		} `json:"from"`
 		Message struct {
 			MessageID int64 `json:"message_id"`
@@ -271,6 +277,15 @@ func (b Bot) handle(ctx context.Context, x update) {
 	u, e := b.Store.Ensure(id)
 	if e != nil {
 		return
+	}
+	if x.Message != nil {
+		if e := b.Store.UpdateTelegramSender(id, x.Message.From.FirstName, x.Message.From.LastName, x.Message.From.Username); e != nil {
+			slog.Warn("telegram_profile_update_failed", "error", e)
+		}
+	} else if x.Callback != nil {
+		if e := b.Store.UpdateTelegramSender(id, x.Callback.From.FirstName, x.Callback.From.LastName, x.Callback.From.Username); e != nil {
+			slog.Warn("telegram_profile_update_failed", "error", e)
+		}
 	}
 	if text == "/admin" {
 		if id != profile.AdminID {

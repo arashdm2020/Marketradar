@@ -9,20 +9,30 @@ import { clientPost } from '@/lib/api';
 import { Users } from '@/lib/types';
 import { ConfirmButton } from '@/components/confirm-button';
 
-type Row = { key:string; id:number; channel:string; identity:string; searchText:string; displayName:string; username:string; phone:string; subscription:string; free:string; exempt:boolean; plan:string };
+type Row = { key:string; id:number; channel:string; identity:string; searchText:string; displayName:string; name:string; username:string; phone:string; subscription:string; free:string; exempt:boolean; plan:string };
+
+function telegramNames(user:Users['telegram'][number]) {
+  const fullName=[user.first_name,user.last_name].filter(Boolean).join(' ').trim();
+  const username=user.username?`@${user.username}`:'';
+  const placeholder=`شناسهٔ تلگرام: ${user.id}`;
+  return {
+    displayName:user.display_name||fullName||user.provided_display_name||(username?`نام کاربری: ${username}`:placeholder),
+    name:fullName||(username?`نام کاربری: ${username}`:placeholder),
+  };
+}
 
 export default function UserPage() {
   const {data,error,loading,refresh}=useData<Users>('operations/users');
   const [message,setMessage]=useState('');
   const rows:Row[]=[
-    ...(data?.telegram||[]).map(x=>({key:'telegram:'+x.id,id:x.id,channel:'تلگرام',identity:String(x.id),searchText:[x.id,x.first_name,x.last_name,x.display_name,x.provided_display_name,x.username,x.phone_number].filter(Boolean).join(' '),displayName:x.display_name||[x.first_name,x.last_name].filter(Boolean).join(' ')||'در دسترس نیست',username:x.username?'@'+x.username:'در دسترس نیست',phone:x.phone_number?`${x.phone_number} · ${x.phone_verified?'تأییدشده':'تأییدنشده'}`:'در دسترس نیست',subscription:x.subscription_active?'فعال':x.subscription_until?'منقضی':'بدون اشتراک',free:x.daily_allowance<0?'نامحدود':`${x.daily_remaining} از ${x.daily_allowance}`,exempt:x.exempt,plan:x.plan})),
-    ...(data?.web||[]).map(x=>({key:'web:'+x.id,id:x.id,channel:'وب',identity:x.email,searchText:x.email,displayName:'در دسترس نیست',username:'در دسترس نیست',phone:'در دسترس نیست',subscription:x.subscription_until&&Date.parse(x.subscription_until)>Date.now()?'فعال':x.subscription_until?'منقضی':'بدون اشتراک',free:'برای وب اعمال نمی‌شود',exempt:false,plan:x.plan||'visitor'})),
+    ...(data?.telegram||[]).map(x=>({key:'telegram:'+x.id,id:x.id,channel:'تلگرام',identity:String(x.id),searchText:[x.id,x.first_name,x.last_name,x.display_name,x.provided_display_name,x.username,x.phone_number].filter(Boolean).join(' '),...telegramNames(x),username:x.username?'@'+x.username:'در دسترس نیست',phone:x.phone_number?`${x.phone_number} · ${x.phone_verified?'تأییدشده':'تأییدنشده'}`:'در دسترس نیست',subscription:x.subscription_active?'فعال':x.subscription_until?'منقضی':'بدون اشتراک',free:x.daily_allowance<0?'نامحدود':`${x.daily_remaining} از ${x.daily_allowance}`,exempt:x.exempt,plan:x.plan})),
+    ...(data?.web||[]).map(x=>({key:'web:'+x.id,id:x.id,channel:'وب',identity:x.email,searchText:x.email,displayName:`ایمیل: ${x.email}`,name:'در دسترس نیست',username:'در دسترس نیست',phone:'در دسترس نیست',subscription:x.subscription_until&&Date.parse(x.subscription_until)>Date.now()?'فعال':x.subscription_until?'منقضی':'بدون اشتراک',free:'برای وب اعمال نمی‌شود',exempt:false,plan:x.plan||'visitor'})),
   ];
   async function toggle(row:Row){try{await clientPost('exemption',{user_id:String(row.id),exempt:String(!row.exempt)});setMessage('تغییر ثبت شد');refresh()}catch(e){setMessage((e as Error).message)}}
   const columns:ColumnDef<Row,unknown>[]=[
     {accessorKey:'identity',header:'شناسه',cell:x=><span className="mono">{x.row.original.identity}</span>},
     {accessorKey:'searchText',header:'نام برای جست‌وجو',cell:x=><span>{x.row.original.displayName}</span>},
-    {accessorKey:'displayName',header:'نام'},
+    {accessorKey:'name',header:'نام'},
     {accessorKey:'username',header:'نام کاربری',cell:x=><span dir="ltr" className="mono">{x.row.original.username}</span>},
     {accessorKey:'phone',header:'تلفن',cell:x=><span dir="ltr" className="mono">{x.row.original.phone}</span>},
     {accessorKey:'channel',header:'کانال'},

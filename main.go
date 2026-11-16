@@ -86,7 +86,7 @@ func main() {
 }
 func run() error {
 	if len(os.Args) < 2 {
-		return fmt.Errorf("usage: go run . analyze|inspect|backtest|doctor|bot|web|bnb-check")
+		return fmt.Errorf("usage: go run . analyze|inspect|backtest|doctor|bot|web|bnb-check|profile-backfill")
 	}
 	cfg := config.Load()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
@@ -94,6 +94,33 @@ func run() error {
 	md := marketdata.Client{Key: cfg.TwelveKey}
 	model := ai.Client{Key: cfg.NVIDIAKey, BaseURL: cfg.BaseURL, Model: cfg.Model}
 	command := os.Args[1]
+	if command == "profile-backfill" {
+		flags := flag.NewFlagSet("profile-backfill", flag.ContinueOnError)
+		limit := flags.Int("limit", 20, "maximum existing Telegram users to inspect (1..100)")
+		apply := flags.Bool("apply", false, "persist available profile fields")
+		if err := flags.Parse(os.Args[2:]); err != nil {
+			return err
+		}
+		token := os.Getenv("TELEGRAM_BOT_TOKEN")
+		if token == "" {
+			return fmt.Errorf("TELEGRAM_BOT_TOKEN is required")
+		}
+		path := os.Getenv("SQLITE_PATH")
+		if path == "" {
+			path = "data/tradebot.db"
+		}
+		store, err := profile.Open(path)
+		if err != nil {
+			return err
+		}
+		defer store.DB.Close()
+		bot := telegram.Bot{Token: token, HTTP: &http.Client{Timeout: 10 * time.Second}}
+		result, err := telegram.BackfillProfiles(ctx, store, *limit, *apply, bot.LookupChatProfile)
+		if err != nil {
+			return err
+		}
+		return emit(map[string]any{"mode": map[bool]string{true: "apply", false: "dry_run"}[*apply], "result": result})
+	}
 	if command == "bnb-check" {
 		xpub, rpcURL := os.Getenv("WEB_BSC_XPUB"), os.Getenv("WEB_BSC_RPC_URL")
 		if xpub == "" || rpcURL == "" {

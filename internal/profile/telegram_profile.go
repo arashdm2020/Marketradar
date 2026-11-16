@@ -61,6 +61,76 @@ func (s *Store) telegramProfileTx(tx *sql.Tx, telegramID int64, firstName, lastN
 	return err
 }
 
+// UpdateTelegramSender records verified sender fields supplied by Telegram.
+// Missing fields never erase a previously recorded value.
+func (s *Store) UpdateTelegramSender(telegramID int64, firstName, lastName, username string) error {
+	if telegramID <= 0 {
+		return errors.New("invalid Telegram ID")
+	}
+	firstName = boundedProfileField(firstName, 256)
+	lastName = boundedProfileField(lastName, 256)
+	username = strings.TrimPrefix(boundedProfileField(username, 64), "@")
+	result, err := s.DB.Exec(`UPDATE users SET
+		telegram_first_name=CASE WHEN ?<>'' THEN ? ELSE telegram_first_name END,
+		telegram_last_name=CASE WHEN ?<>'' THEN ? ELSE telegram_last_name END,
+		telegram_username=CASE WHEN ?<>'' THEN ? ELSE telegram_username END,
+		profile_updated_at=CASE WHEN ?<>'' OR ?<>'' OR ?<>'' THEN ? ELSE profile_updated_at END
+		WHERE id=?`, firstName, firstName, lastName, lastName, username, username,
+		firstName, lastName, username, time.Now().UTC().Format(time.RFC3339Nano), telegramID)
+	if err != nil {
+		return err
+	}
+	if n, _ := result.RowsAffected(); n != 1 {
+		return errors.New("Telegram user not found")
+	}
+	return nil
+}
+
+// MissingTelegramProfiles returns existing users who have no recorded name or
+// username. The limit keeps Bot API enrichment bounded and restart-safe.
+func (s *Store) MissingTelegramProfiles(limit int) ([]int64, error) {
+	if limit < 1 || limit > 100 {
+		return nil, errors.New("profile backfill limit must be 1..100")
+	}
+	rows, err := s.DB.Query(`SELECT id FROM users WHERE profile_backfill_checked_at='' AND
+		(trim(telegram_first_name)='' OR trim(telegram_last_name)='' OR trim(telegram_username)='')
+		ORDER BY id LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// BackfillTelegramProfile fills only missing fields. A successful Bot API
+// lookup is marked checked even when Telegram exposes no optional names.
+func (s *Store) BackfillTelegramProfile(telegramID int64, firstName, lastName, username string) error {
+	firstName = boundedProfileField(firstName, 256)
+	lastName = boundedProfileField(lastName, 256)
+	username = strings.TrimPrefix(boundedProfileField(username, 64), "@")
+	result, err := s.DB.Exec(`UPDATE users SET
+		telegram_first_name=CASE WHEN trim(telegram_first_name)='' THEN ? ELSE telegram_first_name END,
+		telegram_last_name=CASE WHEN trim(telegram_last_name)='' THEN ? ELSE telegram_last_name END,
+		telegram_username=CASE WHEN trim(telegram_username)='' THEN ? ELSE telegram_username END,
+		profile_backfill_checked_at=? WHERE id=?`, firstName, lastName, username,
+		time.Now().UTC().Format(time.RFC3339Nano), telegramID)
+	if err != nil {
+		return err
+	}
+	if n, _ := result.RowsAffected(); n != 1 {
+		return errors.New("Telegram user not found")
+	}
+	return nil
+}
+
 func (s *Store) TelegramProfile(telegramID int64) (TelegramProfile, error) {
 	var p TelegramProfile
 	var verified int

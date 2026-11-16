@@ -73,6 +73,7 @@ func Open(path string) (*Store, error) {
 		`ALTER TABLE users ADD COLUMN phone_verified INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE users ADD COLUMN profile_updated_at TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE users ADD COLUMN user_display_name TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE users ADD COLUMN profile_backfill_checked_at TEXT NOT NULL DEFAULT ''`,
 	} {
 		if _, alterErr := db.Exec(stmt); alterErr != nil && !strings.Contains(strings.ToLower(alterErr.Error()), "duplicate column name") {
 			db.Close()
