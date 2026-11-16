@@ -17,7 +17,31 @@ type Store struct{ DB *sql.DB }
 
 func NewStore(db *sql.DB) (*Store, error) {
 	s := &Store{DB: db}
-	_, e := db.Exec(`CREATE TABLE IF NOT EXISTS web_users(id INTEGER PRIMARY KEY,email TEXT NOT NULL UNIQUE,password_hash BLOB NOT NULL,subscription_until TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL);CREATE TABLE IF NOT EXISTS web_sessions(token_hash TEXT PRIMARY KEY,user_id INTEGER NOT NULL REFERENCES web_users(id),expires_at TEXT NOT NULL);CREATE TABLE IF NOT EXISTS wallet_sequence(id INTEGER PRIMARY KEY CHECK(id=1),next_index INTEGER NOT NULL);INSERT OR IGNORE INTO wallet_sequence VALUES(1,0);CREATE TABLE IF NOT EXISTS web_wallets(user_id INTEGER PRIMARY KEY REFERENCES web_users(id),derivation_index INTEGER NOT NULL UNIQUE,address TEXT NOT NULL UNIQUE);CREATE TABLE IF NOT EXISTS web_plan(id INTEGER PRIMARY KEY CHECK(id=1),price_wei TEXT NOT NULL DEFAULT '');INSERT OR IGNORE INTO web_plan VALUES(1,'');CREATE TABLE IF NOT EXISTS web_invoices(id TEXT PRIMARY KEY,user_id INTEGER NOT NULL REFERENCES web_users(id),address TEXT NOT NULL,price_wei TEXT NOT NULL,chain_id INTEGER NOT NULL,created_at TEXT NOT NULL,expires_at TEXT NOT NULL,start_block INTEGER NOT NULL,status TEXT NOT NULL,tx_hash TEXT NOT NULL DEFAULT '');CREATE INDEX IF NOT EXISTS web_invoices_user ON web_invoices(user_id,status);CREATE UNIQUE INDEX IF NOT EXISTS web_one_pending ON web_invoices(user_id) WHERE status='pending';CREATE TABLE IF NOT EXISTS web_payment_events(tx_hash TEXT PRIMARY KEY,invoice_id TEXT NOT NULL DEFAULT '',address TEXT NOT NULL,amount_wei TEXT NOT NULL,block_number INTEGER NOT NULL,block_time TEXT NOT NULL,classification TEXT NOT NULL,seen_at TEXT NOT NULL);CREATE TABLE IF NOT EXISTS web_chain_scan(id INTEGER PRIMARY KEY CHECK(id=1),cursor INTEGER NOT NULL);CREATE TABLE IF NOT EXISTS web_analyses(id TEXT PRIMARY KEY,user_id INTEGER NOT NULL REFERENCES web_users(id),symbol TEXT NOT NULL,timeframe TEXT NOT NULL,style TEXT NOT NULL,status TEXT NOT NULL,config_version INTEGER NOT NULL,engine_candles INTEGER NOT NULL DEFAULT 0,model_candles INTEGER NOT NULL DEFAULT 0,model TEXT NOT NULL DEFAULT '',prompt_version TEXT NOT NULL DEFAULT '',result_json TEXT NOT NULL DEFAULT '',error TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL,updated_at TEXT NOT NULL);CREATE UNIQUE INDEX IF NOT EXISTS web_one_running ON web_analyses(user_id) WHERE status IN ('queued','running');`)
+	_, e := db.Exec(`CREATE TABLE IF NOT EXISTS web_users(id INTEGER PRIMARY KEY,email TEXT NOT NULL UNIQUE,password_hash BLOB NOT NULL,subscription_until TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL);CREATE TABLE IF NOT EXISTS web_sessions(token_hash TEXT PRIMARY KEY,user_id INTEGER NOT NULL REFERENCES web_users(id),expires_at TEXT NOT NULL);CREATE TABLE IF NOT EXISTS wallet_sequence(id INTEGER PRIMARY KEY CHECK(id=1),next_index INTEGER NOT NULL);INSERT OR IGNORE INTO wallet_sequence VALUES(1,0);CREATE TABLE IF NOT EXISTS web_wallets(user_id INTEGER PRIMARY KEY REFERENCES web_users(id),derivation_index INTEGER NOT NULL UNIQUE,address TEXT NOT NULL UNIQUE);CREATE TABLE IF NOT EXISTS web_plan(id INTEGER PRIMARY KEY CHECK(id=1),price_wei TEXT NOT NULL DEFAULT '');INSERT OR IGNORE INTO web_plan VALUES(1,'');CREATE TABLE IF NOT EXISTS web_invoices(id TEXT PRIMARY KEY,user_id INTEGER NOT NULL REFERENCES web_users(id),address TEXT NOT NULL,price_wei TEXT NOT NULL,chain_id INTEGER NOT NULL,created_at TEXT NOT NULL,expires_at TEXT NOT NULL,start_block INTEGER NOT NULL,status TEXT NOT NULL,tx_hash TEXT NOT NULL DEFAULT '');CREATE INDEX IF NOT EXISTS web_invoices_user ON web_invoices(user_id,status);CREATE UNIQUE INDEX IF NOT EXISTS web_one_pending ON web_invoices(user_id) WHERE status='pending';CREATE TABLE IF NOT EXISTS web_payment_events(tx_hash TEXT PRIMARY KEY,invoice_id TEXT NOT NULL DEFAULT '',address TEXT NOT NULL,amount_wei TEXT NOT NULL,block_number INTEGER NOT NULL,block_time TEXT NOT NULL,classification TEXT NOT NULL,seen_at TEXT NOT NULL);CREATE TABLE IF NOT EXISTS web_chain_scan(id INTEGER PRIMARY KEY CHECK(id=1),cursor INTEGER NOT NULL);CREATE TABLE IF NOT EXISTS web_analyses(id TEXT PRIMARY KEY,user_id INTEGER NOT NULL REFERENCES web_users(id),symbol TEXT NOT NULL,timeframe TEXT NOT NULL,style TEXT NOT NULL,status TEXT NOT NULL,config_version INTEGER NOT NULL,engine_candles INTEGER NOT NULL DEFAULT 0,model_candles INTEGER NOT NULL DEFAULT 0,model TEXT NOT NULL DEFAULT '',prompt_version TEXT NOT NULL DEFAULT '',result_json TEXT NOT NULL DEFAULT '',error TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL,updated_at TEXT NOT NULL);CREATE UNIQUE INDEX IF NOT EXISTS web_one_running ON web_analyses(user_id) WHERE status IN ('queued','running');CREATE TABLE IF NOT EXISTS telegram_login_nonces(nonce_hash TEXT PRIMARY KEY,telegram_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,expires_at TEXT NOT NULL,used INTEGER NOT NULL DEFAULT 0);`)
+	if e == nil {
+		if _, x := db.Exec(`ALTER TABLE telegram_login_nonces ADD COLUMN auth_hash TEXT NOT NULL DEFAULT ''`); x != nil && !strings.Contains(strings.ToLower(x.Error()), "duplicate column name") {
+			e = x
+		}
+	}
+	if e == nil {
+		_, e = db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS telegram_login_auth_hash ON telegram_login_nonces(auth_hash) WHERE auth_hash!=''`)
+	}
+	if e == nil {
+		if _, x := db.Exec(`ALTER TABLE web_sessions ADD COLUMN auth_method TEXT NOT NULL DEFAULT 'legacy'`); x != nil && !strings.Contains(strings.ToLower(x.Error()), "duplicate column name") {
+			e = x
+		}
+	}
+	if e == nil {
+		for _, q := range []string{`ALTER TABLE web_users ADD COLUMN telegram_id INTEGER`, `ALTER TABLE web_users ADD COLUMN first_name TEXT NOT NULL DEFAULT ''`, `ALTER TABLE web_users ADD COLUMN username TEXT NOT NULL DEFAULT ''`} {
+			if _, x := db.Exec(q); x != nil && !strings.Contains(strings.ToLower(x.Error()), "duplicate column name") {
+				e = x
+				break
+			}
+		}
+	}
+	if e == nil {
+		_, e = db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS web_user_telegram_id ON web_users(telegram_id) WHERE telegram_id IS NOT NULL`)
+	}
 	if e == nil {
 		if _, alterErr := db.Exec(`ALTER TABLE web_payment_events ADD COLUMN duplicate_count INTEGER NOT NULL DEFAULT 0`); alterErr != nil && !strings.Contains(alterErr.Error(), "duplicate column name") {
 			e = alterErr
@@ -168,8 +192,29 @@ func (s *Store) Login(email, password string) (string, error) {
 func (s *Store) Session(token string) (int64, error) {
 	digest := sha256.Sum256([]byte(token))
 	var id int64
-	e := s.DB.QueryRow(`SELECT user_id FROM web_sessions WHERE token_hash=? AND expires_at>?`, hex.EncodeToString(digest[:]), time.Now().UTC().Format(time.RFC3339)).Scan(&id)
+	e := s.DB.QueryRow(`SELECT ws.user_id FROM web_sessions ws JOIN web_telegram_links l ON l.web_user_id=ws.user_id WHERE ws.token_hash=? AND ws.expires_at>? AND ws.auth_method='telegram'`, hex.EncodeToString(digest[:]), time.Now().UTC().Format(time.RFC3339)).Scan(&id)
 	return id, e
+}
+func (s *Store) CreateSessionForUser(user int64, now time.Time) (string, error) {
+	raw := make([]byte, 32)
+	if _, e := rand.Read(raw); e != nil {
+		return "", e
+	}
+	token := hex.EncodeToString(raw)
+	sum := sha256.Sum256([]byte(token))
+	_, e := s.DB.Exec(`INSERT INTO web_sessions(token_hash,user_id,expires_at,auth_method) VALUES(?,?,?,'telegram')`, hex.EncodeToString(sum[:]), user, now.UTC().Add(12*time.Hour).Format(time.RFC3339))
+	return token, e
+}
+func (s *Store) EnsureTelegramAccount(telegramID int64, firstName, username string) (int64, error) {
+	var id int64
+	e := s.DB.QueryRow(`SELECT id FROM web_users WHERE telegram_id=?`, telegramID).Scan(&id)
+	if e == nil {
+		return id, nil
+	}
+	if e != sql.ErrNoRows {
+		return 0, e
+	}
+	return 0, errors.New("Telegram mapping missing")
 }
 func (s *Store) Logout(token string) error {
 	digest := sha256.Sum256([]byte(token))

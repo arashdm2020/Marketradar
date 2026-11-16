@@ -1,11 +1,20 @@
 package webapp
 
 import (
+	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	_ "embed"
+	"encoding/hex"
 	"encoding/json"
 	"html/template"
+	"math/big"
 	"net/http"
 	"net/url"
+	"os"
+	"sort"
+	"strconv"
+	"strings"
 	"time"
 	"tradebot/internal/domain"
 	"tradebot/internal/profile"
@@ -22,19 +31,107 @@ type Handler struct {
 	Profile  *profile.Store
 }
 
+type telegramLoginPayload struct {
+	ID              int64  `json:"id"`
+	FirstName       string `json:"first_name"`
+	LastName        string `json:"last_name"`
+	Username        string `json:"username"`
+	PhotoURL        string `json:"photo_url"`
+	AuthDate        int64  `json:"auth_date"`
+	Hash            string `json:"hash"`
+	Nonce           string `json:"nonce"`
+	AllowsWriteToPM string `json:"allows_write_to_pm"`
+}
+
+func verifyTelegramLogin(v telegramLoginPayload, botToken string, now time.Time) bool {
+	if botToken == "" || v.ID <= 0 || v.Hash == "" || now.Sub(time.Unix(v.AuthDate, 0)) > 5*time.Minute || time.Unix(v.AuthDate, 0).After(now.Add(time.Minute)) {
+		return false
+	}
+	// Telegram's Login Widget signature covers only fields returned by Telegram;
+	// the browser state nonce is independently one-time consumed in SQLite.
+	data := map[string]string{"id": strconv.FormatInt(v.ID, 10), "first_name": v.FirstName, "auth_date": strconv.FormatInt(v.AuthDate, 10)}
+	for key, value := range map[string]string{"last_name": v.LastName, "username": v.Username, "photo_url": v.PhotoURL, "allows_write_to_pm": v.AllowsWriteToPM} {
+		if value != "" {
+			data[key] = value
+		}
+	}
+	keys := make([]string, 0, len(data))
+	for k := range data {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		parts = append(parts, k+"="+data[k])
+	}
+	secret := sha256.Sum256([]byte(botToken))
+	mac := hmac.New(sha256.New, secret[:])
+	_, _ = mac.Write([]byte(strings.Join(parts, "\n")))
+	want, e := hex.DecodeString(v.Hash)
+	return e == nil && hmac.Equal(mac.Sum(nil), want)
+}
+
 func (h *Handler) Routes() http.Handler {
 	m := http.NewServeMux()
 	m.HandleFunc("/app/", h.home)
 	m.HandleFunc("/app/register", h.register)
 	m.HandleFunc("/app/login", h.login)
 	m.HandleFunc("/app/logout", h.logout)
+	m.HandleFunc("/app/api/logout", h.logoutAPI)
 	m.HandleFunc("/app/api/me", h.me)
+	m.HandleFunc("/app/api/telegram/nonce", h.telegramNonce)
+	m.HandleFunc("/app/api/telegram/callback", h.telegramCallback)
 	m.HandleFunc("/app/api/invoice", h.invoice)
 	m.HandleFunc("/app/api/analyze", h.analyze)
 	m.HandleFunc("/app/api/analysis", h.analysis)
 	m.HandleFunc("/app/api/analyses", h.analyses)
 	m.HandleFunc("/app/link", h.link)
 	return m
+}
+
+func (h *Handler) telegramNonce(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	if !sameOrigin(w, r) {
+		return
+	}
+	if h.Profile == nil {
+		http.Error(w, "Telegram login unavailable", 503)
+		return
+	}
+	nonce, err := h.Profile.IssueTelegramLoginNonce(time.Now())
+	if err != nil {
+		http.Error(w, "Telegram login unavailable", 503)
+		return
+	}
+	out(w, map[string]string{"nonce": nonce})
+}
+
+func (h *Handler) telegramCallback(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	if r.Method != "POST" || !sameOrigin(w, r) {
+		return
+	}
+	if h.Profile == nil {
+		http.Error(w, "Telegram login unavailable", 503)
+		return
+	}
+	var payload telegramLoginPayload
+	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<10)).Decode(&payload) != nil || payload.ID <= 0 || payload.Nonce == "" || !verifyTelegramLogin(payload, os.Getenv("TELEGRAM_BOT_TOKEN"), time.Now()) {
+		http.Error(w, "Telegram authentication failed", 401)
+		return
+	}
+	webID, e := h.Profile.TelegramLoginOnce(payload.Nonce, payload.Hash, payload.ID, payload.FirstName, payload.Username, time.Now())
+	if e != nil {
+		http.Error(w, "Telegram login expired or already used", 401)
+		return
+	}
+	token, e := h.Store.CreateSessionForUser(webID, time.Now())
+	if e != nil {
+		http.Error(w, "session unavailable", 500)
+		return
+	}
+	h.setSession(w, token, r)
+	out(w, map[string]any{"ok": true})
 }
 func (h *Handler) user(r *http.Request) (int64, error) {
 	c, e := r.Cookie("mr_web")
@@ -65,35 +162,14 @@ func sameOrigin(w http.ResponseWriter, r *http.Request) bool {
 	return true
 }
 func (h *Handler) setSession(w http.ResponseWriter, token string, r *http.Request) {
-	http.SetCookie(w, &http.Cookie{Name: "mr_web", Value: token, Path: "/app", HttpOnly: true, SameSite: http.SameSiteStrictMode, Secure: r.TLS != nil, MaxAge: 43200})
+	secure := r.TLS != nil || strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https")
+	http.SetCookie(w, &http.Cookie{Name: "mr_web", Value: token, Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode, Secure: secure, MaxAge: 43200})
 }
 func (h *Handler) register(w http.ResponseWriter, r *http.Request) {
-	if !sameOrigin(w, r) {
-		return
-	}
-	if _, e := h.Store.Register(r.FormValue("email"), r.FormValue("password")); e != nil {
-		http.Error(w, "registration failed", 400)
-		return
-	}
-	token, e := h.Store.Login(r.FormValue("email"), r.FormValue("password"))
-	if e != nil {
-		http.Error(w, "login failed", 500)
-		return
-	}
-	h.setSession(w, token, r)
-	http.Redirect(w, r, safeNext(r.FormValue("next")), 303)
+	http.Error(w, "use Telegram authentication", http.StatusGone)
 }
 func (h *Handler) login(w http.ResponseWriter, r *http.Request) {
-	if !sameOrigin(w, r) {
-		return
-	}
-	token, e := h.Store.Login(r.FormValue("email"), r.FormValue("password"))
-	if e != nil {
-		http.Error(w, "invalid credentials", 401)
-		return
-	}
-	h.setSession(w, token, r)
-	http.Redirect(w, r, safeNext(r.FormValue("next")), 303)
+	http.Error(w, "use Telegram authentication", http.StatusGone)
 }
 func safeNext(v string) string {
 	if len(v) == len("/app/link?token=")+36 && len(v) >= len("/app/link?token=") && v[:len("/app/link?token=")] == "/app/link?token=" {
@@ -139,14 +215,31 @@ func (h *Handler) logout(w http.ResponseWriter, r *http.Request) {
 	if c, e := r.Cookie("mr_web"); e == nil {
 		_ = h.Store.Logout(c.Value)
 	}
-	http.SetCookie(w, &http.Cookie{Name: "mr_web", Value: "", Path: "/app", MaxAge: -1, SameSite: http.SameSiteStrictMode})
+	http.SetCookie(w, &http.Cookie{Name: "mr_web", Value: "", Path: "/", MaxAge: -1, SameSite: http.SameSiteLaxMode, HttpOnly: true, Secure: r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")})
 	http.Redirect(w, r, "/app/", 303)
+}
+func (h *Handler) logoutAPI(w http.ResponseWriter, r *http.Request) {
+	if !sameOrigin(w, r) {
+		return
+	}
+	if c, e := r.Cookie("mr_web"); e == nil {
+		_ = h.Store.Logout(c.Value)
+	}
+	http.SetCookie(w, &http.Cookie{Name: "mr_web", Value: "", Path: "/", MaxAge: -1, SameSite: http.SameSiteLaxMode, HttpOnly: true, Secure: r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")})
+	out(w, map[string]bool{"ok": true})
 }
 func (h *Handler) home(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if _, e := h.user(r); e != nil {
-		t := template.Must(template.New("login").Parse(`<html lang="fa" dir="rtl"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MarketRadar</title><style>body{font:16px sans-serif;max-width:860px;margin:5vh auto;padding:1rem;background:#f3f6fb;color:#17233a}main{display:grid;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));gap:1rem}section{background:white;padding:1.5rem;border-radius:16px;box-shadow:0 8px 28px #1232}input,button{box-sizing:border-box;width:100%;padding:.75rem;margin:.4rem 0;border-radius:9px}input{border:1px solid #c4cfdd}button{background:#165bc5;color:white;border:0;cursor:pointer}</style><h1>MarketRadar</h1><p>مسیر دسترسی: اشتراک ← فاکتور ← تأیید پرداخت ← تحلیل</p><main><section><h2>ساخت حساب</h2><form method="post" action="/app/register"><input type="hidden" name="next" value="{{.}}"><input type="email" name="email" placeholder="ایمیل" required><input type="password" name="password" minlength="12" placeholder="رمز عبور حداقل ۱۲ نویسه" required><button>ثبت‌نام</button></form></section><section><h2>ورود</h2><form method="post" action="/app/login"><input type="hidden" name="next" value="{{.}}"><input type="email" name="email" placeholder="ایمیل" required><input type="password" name="password" required><button>ورود</button></form></section></main></html>`))
-		_ = t.Execute(w, safeNext(r.URL.Query().Get("next")))
+		loginURL := strings.TrimSpace(os.Getenv("WEB_PUBLIC_URL"))
+		if loginURL == "" {
+			loginURL = "/login"
+		}
+		if parsed, err := url.Parse(loginURL); err != nil || parsed.IsAbs() && parsed.Scheme != "https" || !parsed.IsAbs() && !strings.HasPrefix(parsed.Path, "/") {
+			loginURL = "/login"
+		}
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`<html lang="fa" dir="rtl"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ورود به MarketRadar</title><body style="font:16px sans-serif;max-width:600px;margin:12vh auto;padding:1.5rem;background:#0b1322;color:#f8fafc"><main style="padding:2rem;border:1px solid #26364d;border-radius:20px;background:#121e30"><h1>ورود به MarketRadar</h1><p>ورود به حساب فقط با تأیید هویت تلگرام انجام می‌شود.</p><a style="display:inline-block;padding:.8rem 1.2rem;border-radius:10px;background:#f28c38;color:#101827;text-decoration:none" href="` + template.HTMLEscapeString(loginURL) + `">ادامه با تلگرام</a></main></body></html>`))
 		return
 	}
 	_, _ = w.Write(userPage)
@@ -156,28 +249,88 @@ func out(w http.ResponseWriter, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 func (h *Handler) me(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
 	id, ok := h.require(w, r)
 	if !ok {
 		return
 	}
-	until, e := h.Store.Subscription(id)
-	if e != nil {
-		http.Error(w, "database error", 500)
+	if h.Profile == nil {
+		http.Error(w, "profile unavailable", 503)
 		return
 	}
-	price, e := h.Store.Price()
-	ready := h.Billing != nil && h.Billing.Ready()
-	v := map[string]any{"subscription_active": until.After(time.Now()), "subscription_until": until, "billing_ready": ready, "invoice_available": false}
-	if e == nil {
-		v["price_wei"] = price.String()
-		if ready && h.Billing.TestInvoicesEnabled {
-			var email string
-			if h.Store.DB.QueryRow(`SELECT email FROM web_users WHERE id=?`, id).Scan(&email) == nil && normalizeEmail(email) == normalizeEmail(h.Billing.TestEmail) {
-				v["invoice_available"] = true
+	tgID, e := h.Profile.TelegramForWebUser(id)
+	if e != nil {
+		http.Error(w, "Telegram account not linked", 403)
+		return
+	}
+	access, e := h.Profile.Access(tgID, time.Now())
+	if e != nil {
+		http.Error(w, "access status unavailable", 500)
+		return
+	}
+	var firstName, username string
+	if e = h.Store.DB.QueryRow(`SELECT first_name,username FROM web_users WHERE id=?`, id).Scan(&firstName, &username); e != nil {
+		http.Error(w, "profile unavailable", 500)
+		return
+	}
+	address := ""
+	if wallet, walletErr := h.Profile.WalletRecordForTelegram(tgID); walletErr == nil {
+		address = wallet.Address
+	}
+	balance := ""
+	if address != "" && h.Billing != nil && h.Billing.Chain != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		if chainID, chainErr := h.Billing.Chain.ChainID(ctx); chainErr == nil && chainID == h.Billing.ExpectedChainID {
+			if amount, balanceErr := h.Billing.Chain.Balance(ctx, address); balanceErr == nil {
+				balance = formatBNB(amount)
 			}
 		}
+		cancel()
+	}
+	price, priceErr := h.Store.Price()
+	ready := h.Billing != nil && h.Billing.Ready()
+	network := "نامشخص"
+	chainID := uint64(0)
+	if h.Billing != nil {
+		chainID = h.Billing.ExpectedChainID
+	}
+	switch chainID {
+	case 56:
+		network = "BNB Smart Chain Mainnet"
+	case 97:
+		network = "BNB Smart Chain Testnet"
+	}
+	invoiceAvailable := false
+	if ready && h.Billing.TestInvoicesEnabled {
+		var email string
+		invoiceAvailable = h.Store.DB.QueryRow(`SELECT email FROM web_users WHERE id=?`, id).Scan(&email) == nil && normalizeEmail(email) == normalizeEmail(h.Billing.TestEmail)
+	}
+	v := map[string]any{
+		"profile":       map[string]any{"telegram_id": tgID, "first_name": firstName, "username": username},
+		"subscription":  map[string]any{"plan": access.Policy.Label, "active": access.SubscriptionActive, "until": access.SubscriptionUntil},
+		"quota":         map[string]any{"daily_allowance": access.Allowance, "used": access.Used, "remaining": access.Remaining, "exempt": access.Exempt},
+		"wallet":        map[string]any{"address": address, "network": network, "chain_id": chainID, "balance_bnb": balance},
+		"billing_ready": ready, "invoice_available": invoiceAvailable,
+	}
+	if priceErr == nil {
+		v["price_wei"] = price.String()
 	}
 	out(w, v)
+}
+
+func formatBNB(wei *big.Int) string {
+	if wei == nil {
+		return ""
+	}
+	denom := new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil)
+	whole, frac := new(big.Int), new(big.Int)
+	whole.QuoRem(wei, denom, frac)
+	if frac.Sign() == 0 {
+		return whole.String()
+	}
+	decimals := frac.String()
+	decimals = strings.Repeat("0", 18-len(decimals)) + decimals
+	return whole.String() + "." + strings.TrimRight(decimals, "0")
 }
 func (h *Handler) invoice(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "GET" {

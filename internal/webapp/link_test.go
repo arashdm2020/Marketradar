@@ -130,16 +130,24 @@ func TestQuotaLinkInvoicePaymentAndExpiry(t *testing.T) {
 func TestWebLinkRequiresLoginAndConfirmation(t *testing.T) {
 	p, web := testStores(t)
 	defer p.DB.Close()
-	_, _ = p.Ensure(75002)
-	_, e := web.Register("confirm@example.com", "long-confirm-password")
+	const telegramID int64 = 75002
+	_, e := p.Ensure(telegramID)
 	if e != nil {
 		t.Fatal(e)
 	}
-	session, e := web.Login("confirm@example.com", "long-confirm-password")
+	state, e := p.IssueTelegramLoginNonce(time.Now())
 	if e != nil {
 		t.Fatal(e)
 	}
-	token, e := p.IssueWebLink(75002, time.Now())
+	webID, e := p.TelegramLoginOnce(state, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", telegramID, "Confirm", "confirm", time.Now())
+	if e != nil {
+		t.Fatal(e)
+	}
+	session, e := web.CreateSessionForUser(webID, time.Now())
+	if e != nil {
+		t.Fatal(e)
+	}
+	token, e := p.IssueWebLink(telegramID, time.Now())
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -157,9 +165,9 @@ func TestWebLinkRequiresLoginAndConfirmation(t *testing.T) {
 	if w.Code != 200 || !strings.Contains(w.Body.String(), "تأیید اتصال این حساب") {
 		t.Fatalf("confirmation status %d", w.Code)
 	}
-	linked, _, e := p.WebSubscription(75002)
-	if e != nil || linked {
-		t.Fatal("GET linked account without confirmation")
+	var used int
+	if e = p.DB.QueryRow(`SELECT used FROM web_link_tokens WHERE telegram_id=? ORDER BY rowid DESC LIMIT 1`, telegramID).Scan(&used); e != nil || used != 0 {
+		t.Fatal("GET consumed the confirmation token")
 	}
 	form := url.Values{"token": {token}}
 	r = httptest.NewRequest("POST", "/app/link", strings.NewReader(form.Encode()))
@@ -172,7 +180,7 @@ func TestWebLinkRequiresLoginAndConfirmation(t *testing.T) {
 	if w.Code != 303 {
 		t.Fatalf("confirmed link status %d: %s", w.Code, w.Body.String())
 	}
-	linked, _, e = p.WebSubscription(75002)
+	linked, _, e := p.WebSubscription(telegramID)
 	if e != nil || !linked {
 		t.Fatal("confirmed account not linked")
 	}
@@ -181,11 +189,20 @@ func TestWebLinkRequiresLoginAndConfirmation(t *testing.T) {
 func TestUserPanelShowsInvoiceFieldsAndDisabledBilling(t *testing.T) {
 	p, web := testStores(t)
 	defer p.DB.Close()
-	_, e := web.Register("panel@example.com", "long-panel-password")
+	const telegramID int64 = 75003
+	_, e := p.Ensure(telegramID)
 	if e != nil {
 		t.Fatal(e)
 	}
-	session, e := web.Login("panel@example.com", "long-panel-password")
+	state, e := p.IssueTelegramLoginNonce(time.Now())
+	if e != nil {
+		t.Fatal(e)
+	}
+	webID, e := p.TelegramLoginOnce(state, "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210", telegramID, "Panel", "panel", time.Now())
+	if e != nil {
+		t.Fatal(e)
+	}
+	session, e := web.CreateSessionForUser(webID, time.Now())
 	if e != nil {
 		t.Fatal(e)
 	}

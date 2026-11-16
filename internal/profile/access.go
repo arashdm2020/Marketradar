@@ -6,6 +6,8 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"errors"
+	"fmt"
+	"golang.org/x/crypto/bcrypt"
 	"strings"
 	"time"
 
@@ -28,8 +30,14 @@ func NewID() string {
 	return v[:8] + "-" + v[8:12] + "-" + v[12:16] + "-" + v[16:20] + "-" + v[20:]
 }
 func (s *Store) MigrateAccess() error {
-	_, e := s.DB.Exec(`CREATE TABLE IF NOT EXISTS entitlements(user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,exempt INTEGER NOT NULL DEFAULT 0,subscription_until TEXT NOT NULL DEFAULT '');CREATE TABLE IF NOT EXISTS daily_uses(analysis_id TEXT PRIMARY KEY,user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,day_tehran TEXT NOT NULL,status TEXT NOT NULL);CREATE INDEX IF NOT EXISTS daily_uses_day ON daily_uses(user_id,day_tehran,status);CREATE TABLE IF NOT EXISTS payment_events(charge_id TEXT PRIMARY KEY,user_id INTEGER NOT NULL REFERENCES users(id),kind TEXT NOT NULL,created_at TEXT NOT NULL);CREATE TABLE IF NOT EXISTS admin_audit(id INTEGER PRIMARY KEY,admin_id INTEGER NOT NULL,target_id INTEGER,action TEXT NOT NULL,detail TEXT NOT NULL,at_utc TEXT NOT NULL);CREATE TABLE IF NOT EXISTS analysis_config(version INTEGER PRIMARY KEY,engine_candles INTEGER NOT NULL,model_candles INTEGER NOT NULL,active INTEGER NOT NULL DEFAULT 0);INSERT OR IGNORE INTO analysis_config(version,engine_candles,model_candles,active) VALUES(1,500,500,1);INSERT OR IGNORE INTO analysis_config(version,engine_candles,model_candles,active) VALUES(2,500,50,0);`)
+	_, e := s.DB.Exec(`CREATE TABLE IF NOT EXISTS entitlements(user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,exempt INTEGER NOT NULL DEFAULT 0,subscription_until TEXT NOT NULL DEFAULT '');CREATE TABLE IF NOT EXISTS daily_uses(analysis_id TEXT PRIMARY KEY,user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,day_tehran TEXT NOT NULL,status TEXT NOT NULL);CREATE INDEX IF NOT EXISTS daily_uses_day ON daily_uses(user_id,day_tehran,status);CREATE TABLE IF NOT EXISTS payment_events(charge_id TEXT PRIMARY KEY,user_id INTEGER NOT NULL REFERENCES users(id),kind TEXT NOT NULL,created_at TEXT NOT NULL);CREATE TABLE IF NOT EXISTS admin_audit(id INTEGER PRIMARY KEY,admin_id INTEGER NOT NULL,target_id INTEGER,action TEXT NOT NULL,detail TEXT NOT NULL,at_utc TEXT NOT NULL);CREATE TABLE IF NOT EXISTS analysis_config(version INTEGER PRIMARY KEY,engine_candles INTEGER NOT NULL,model_candles INTEGER NOT NULL,active INTEGER NOT NULL DEFAULT 0);CREATE TABLE IF NOT EXISTS telegram_login_states(nonce_hash TEXT PRIMARY KEY,expires_at TEXT NOT NULL,used INTEGER NOT NULL DEFAULT 0);CREATE TABLE IF NOT EXISTS telegram_login_nonces(nonce_hash TEXT PRIMARY KEY,telegram_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,expires_at TEXT NOT NULL,used INTEGER NOT NULL DEFAULT 0,auth_hash TEXT NOT NULL DEFAULT '');INSERT OR IGNORE INTO analysis_config(version,engine_candles,model_candles,active) VALUES(1,500,500,1);INSERT OR IGNORE INTO analysis_config(version,engine_candles,model_candles,active) VALUES(2,500,50,0);`)
 	if e != nil {
+		return e
+	}
+	if _, alterErr := s.DB.Exec(`ALTER TABLE telegram_login_nonces ADD COLUMN auth_hash TEXT NOT NULL DEFAULT ''`); alterErr != nil && !strings.Contains(strings.ToLower(alterErr.Error()), "duplicate column name") {
+		return alterErr
+	}
+	if _, e = s.DB.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS telegram_login_auth_hash ON telegram_login_nonces(auth_hash) WHERE auth_hash!=''`); e != nil {
 		return e
 	}
 	if e = s.migrateEntitlementPlans(); e != nil {
@@ -305,6 +313,122 @@ func (s *Store) ConsumeWebLink(token string, webUser int64, now time.Time) error
 		return errors.New("link expired or used")
 	}
 	return tx.Commit()
+}
+
+// TelegramLoginOnce atomically consumes both the browser state nonce and the
+// signed Telegram assertion. The caller must verify Telegram's HMAC first.
+// Identity and wallet records remain Telegram-owned.
+func (s *Store) TelegramLoginOnce(nonce, authHash string, telegramID int64, firstName, username string, now time.Time) (int64, error) {
+	if len(nonce) < 32 || len(authHash) < 32 || telegramID <= 0 {
+		return 0, errors.New("invalid Telegram login")
+	}
+	h := sha256.Sum256([]byte(nonce))
+	hash := hex.EncodeToString(h[:])
+	authDigest := sha256.Sum256([]byte(authHash))
+	tx, e := s.DB.Begin()
+	if e != nil {
+		return 0, e
+	}
+	defer tx.Rollback()
+	var expires string
+	var used int
+	e = tx.QueryRow(`SELECT expires_at,used FROM telegram_login_states WHERE nonce_hash=?`, hash).Scan(&expires, &used)
+	if e != nil || used != 0 {
+		return 0, errors.New("login state invalid or consumed")
+	}
+	deadline, parseErr := time.Parse(time.RFC3339Nano, expires)
+	if parseErr != nil || !deadline.After(now) {
+		return 0, errors.New("login state expired")
+	}
+	var exists int
+	if e = tx.QueryRow(`SELECT count(*) FROM users WHERE id=?`, telegramID).Scan(&exists); e != nil || exists != 1 {
+		return 0, errors.New("Telegram user not found; open the bot first")
+	}
+	// Unique nonce and assertion hashes make repeated browser state and replay
+	// of a still-fresh Telegram widget assertion fail closed.
+	if _, e = tx.Exec(`INSERT INTO telegram_login_nonces(nonce_hash,telegram_id,expires_at,used,auth_hash) VALUES(?,?,?,1,?)`, hash, telegramID, now.UTC().Add(5*time.Minute).Format(time.RFC3339Nano), hex.EncodeToString(authDigest[:])); e != nil {
+		return 0, errors.New("login assertion replay")
+	}
+	res, e := tx.Exec(`UPDATE telegram_login_states SET used=1 WHERE nonce_hash=? AND used=0 AND expires_at>?`, hash, now.UTC().Format(time.RFC3339Nano))
+	if e != nil {
+		return 0, e
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return 0, errors.New("login state replay")
+	}
+	var id int64
+	e = tx.QueryRow(`SELECT web_user_id FROM web_telegram_links WHERE telegram_id=?`, telegramID).Scan(&id)
+	if e != nil && e != sql.ErrNoRows {
+		return 0, e
+	}
+	if e == sql.ErrNoRows {
+		// Adopt an existing web row mapped by Telegram ID before creating one.
+		e = tx.QueryRow(`SELECT id FROM web_users WHERE telegram_id=?`, telegramID).Scan(&id)
+		if e != nil && e != sql.ErrNoRows {
+			return 0, e
+		}
+	}
+	if e == sql.ErrNoRows {
+		// Legacy web schema still requires unique email and password columns.
+		email := fmt.Sprintf("tg-%d@telegram.invalid", telegramID)
+		random := make([]byte, 32)
+		if _, e = rand.Read(random); e != nil {
+			return 0, errors.New("session generation failed")
+		}
+		hashPass, e := bcrypt.GenerateFromPassword([]byte(hex.EncodeToString(random)), bcrypt.DefaultCost)
+		if e != nil {
+			return 0, e
+		}
+		_, e = tx.Exec(`INSERT OR IGNORE INTO web_users(email,password_hash,created_at,telegram_id,first_name,username) VALUES(?,?,?,?,?,?)`, email, hashPass, now.UTC().Format(time.RFC3339), telegramID, firstName, username)
+		if e != nil {
+			return 0, e
+		}
+		if e = tx.QueryRow(`SELECT id FROM web_users WHERE telegram_id=?`, telegramID).Scan(&id); e != nil {
+			return 0, e
+		}
+	}
+	if _, e = tx.Exec(`INSERT OR IGNORE INTO web_telegram_links(telegram_id,web_user_id,linked_at) VALUES(?,?,?)`, telegramID, id, now.UTC().Format(time.RFC3339)); e != nil {
+		return 0, e
+	}
+	var mappedWeb, mappedTelegram int64
+	if e = tx.QueryRow(`SELECT web_user_id FROM web_telegram_links WHERE telegram_id=?`, telegramID).Scan(&mappedWeb); e != nil || mappedWeb != id {
+		return 0, errors.New("Telegram account is already linked to another web identity")
+	}
+	if e = tx.QueryRow(`SELECT telegram_id FROM web_telegram_links WHERE web_user_id=?`, id).Scan(&mappedTelegram); e != nil || mappedTelegram != telegramID {
+		return 0, errors.New("web identity is already linked to another Telegram account")
+	}
+	updated, e := tx.Exec(`UPDATE web_users SET telegram_id=?,first_name=?,username=? WHERE id=? AND (telegram_id IS NULL OR telegram_id=?)`, telegramID, firstName, username, id, telegramID)
+	if e != nil {
+		return 0, e
+	}
+	if affected, _ := updated.RowsAffected(); affected != 1 {
+		return 0, errors.New("stored Telegram identity mismatch")
+	}
+	return id, tx.Commit()
+}
+
+func (s *Store) IssueTelegramLoginNonce(now time.Time) (string, error) {
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return "", err
+	}
+	token := hex.EncodeToString(raw)
+	digest := sha256.Sum256([]byte(token))
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback()
+	if _, err = tx.Exec(`DELETE FROM telegram_login_states WHERE expires_at<=? OR used=1`, now.UTC().Format(time.RFC3339Nano)); err != nil {
+		return "", err
+	}
+	if _, err = tx.Exec(`DELETE FROM telegram_login_nonces WHERE expires_at<=?`, now.UTC().Format(time.RFC3339Nano)); err != nil {
+		return "", err
+	}
+	if _, err = tx.Exec(`INSERT INTO telegram_login_states(nonce_hash,expires_at) VALUES(?,?)`, hex.EncodeToString(digest[:]), now.UTC().Add(5*time.Minute).Format(time.RFC3339Nano)); err != nil {
+		return "", err
+	}
+	return token, tx.Commit()
 }
 
 func (s *Store) WebSubscription(user int64) (bool, time.Time, error) {

@@ -22,7 +22,22 @@ func TestBrowserFlowInvoiceToAnalysis(t *testing.T) {
 	billing := &Billing{Store: s, Deriver: testDeriver(t), Chain: chain, ExpectedChainID: 97, Confirmations: 2, ReferenceVerified: true}
 	billing.TestInvoicesEnabled = true
 	billing.TestEmail = "browser@example.com"
-	h := (&Handler{Store: s, Billing: billing, Analysis: &AnalysisService{Store: s, Config: p, Engine: fakeAnalyzer{}, Context: context.Background()}}).Routes()
+	state, e := p.IssueTelegramLoginNonce(time.Now())
+	if e != nil {
+		t.Fatal(e)
+	}
+	webID, e := p.TelegramLoginOnce(state, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", tgID, "Browser", "browser", time.Now())
+	if e != nil {
+		t.Fatal(e)
+	}
+	if _, e = s.DB.Exec(`UPDATE web_users SET email=? WHERE id=?`, "browser@example.com", webID); e != nil {
+		t.Fatal(e)
+	}
+	session, e := s.CreateSessionForUser(webID, time.Now())
+	if e != nil {
+		t.Fatal(e)
+	}
+	h := (&Handler{Store: s, Billing: billing, Profile: p, Analysis: &AnalysisService{Store: s, Config: p, Engine: fakeAnalyzer{}, Context: context.Background()}}).Routes()
 	post := func(path string, form url.Values, cookie string) *httptest.ResponseRecorder {
 		r := httptest.NewRequest("POST", path, strings.NewReader(form.Encode()))
 		r.Header.Set("Origin", "http://example.test")
@@ -35,16 +50,7 @@ func TestBrowserFlowInvoiceToAnalysis(t *testing.T) {
 		h.ServeHTTP(w, r)
 		return w
 	}
-	register := post("/app/register", url.Values{"email": {"browser@example.com"}, "password": {"long-browser-password"}}, "")
-	if register.Code != 303 {
-		t.Fatalf("register %d", register.Code)
-	}
-	cookie := register.Result().Cookies()[0].String()
-	webID, _ := s.Session(register.Result().Cookies()[0].Value)
-	token, _ := p.IssueWebLink(tgID, time.Now())
-	if e := p.ConsumeWebLink(token, webID, time.Now()); e != nil {
-		t.Fatal(e)
-	}
+	cookie := "mr_web=" + session
 	if w := post("/app/api/invoice", url.Values{}, cookie); w.Code != 503 {
 		t.Fatalf("invoice allowed before price %d", w.Code)
 	}
