@@ -20,6 +20,7 @@ import (
 	"tradebot/internal/adminweb"
 	"tradebot/internal/ai"
 	"tradebot/internal/aimgmt"
+	"tradebot/internal/announcement"
 	"tradebot/internal/backtest"
 	"tradebot/internal/bnb"
 	"tradebot/internal/catalog"
@@ -86,7 +87,7 @@ func main() {
 }
 func run() error {
 	if len(os.Args) < 2 {
-		return fmt.Errorf("usage: go run . analyze|inspect|backtest|doctor|bot|web|bnb-check|profile-backfill")
+		return fmt.Errorf("usage: go run . analyze|inspect|backtest|doctor|bot|web|bnb-check|profile-backfill|announcement")
 	}
 	cfg := config.Load()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
@@ -94,6 +95,56 @@ func run() error {
 	md := marketdata.Client{Key: cfg.TwelveKey}
 	model := ai.Client{Key: cfg.NVIDIAKey, BaseURL: cfg.BaseURL, Model: cfg.Model}
 	command := os.Args[1]
+	if command == "announcement" {
+		flags := flag.NewFlagSet("announcement", flag.ContinueOnError)
+		dryRun := flags.Bool("dry-run", false, "freeze recipients and show campaign sequence")
+		adminTest := flags.Bool("admin-test", false, "send only to the administrator")
+		broadcast := flags.Bool("broadcast", false, "send to frozen recipients after approved admin test")
+		confirm := flags.String("confirm-campaign", "", "campaign ID required for broadcast")
+		if err := flags.Parse(os.Args[2:]); err != nil {
+			return err
+		}
+		if flags.NArg() != 0 || map[bool]int{true: 1}[*dryRun]+map[bool]int{true: 1}[*adminTest]+map[bool]int{true: 1}[*broadcast] != 1 {
+			return fmt.Errorf("select exactly one announcement mode")
+		}
+		if *broadcast && *confirm != announcement.CampaignID {
+			return fmt.Errorf("broadcast requires --confirm-campaign=%s", announcement.CampaignID)
+		}
+		path := os.Getenv("SQLITE_PATH")
+		if path == "" {
+			path = "data/tradebot.db"
+		}
+		profileStore, err := profile.Open(path)
+		if err != nil {
+			return err
+		}
+		defer profileStore.DB.Close()
+		campaign := announcement.Store{DB: profileStore.DB}
+		if *dryRun {
+			result, err := campaign.Prepare(ctx)
+			if err != nil {
+				return err
+			}
+			return emit(map[string]any{"mode": "dry_run", "summary": result, "sequence": []string{"standalone custom emoji", "standalone custom emoji", "one message: English, Turkish, Persian"}})
+		}
+		if err := campaign.Migrate(); err != nil {
+			return err
+		}
+		summary, err := campaign.Summary(ctx)
+		if err != nil || summary.Recipients == 0 {
+			return fmt.Errorf("announcement dry-run is required first")
+		}
+		token := os.Getenv("TELEGRAM_BOT_TOKEN")
+		if token == "" {
+			return fmt.Errorf("TELEGRAM_BOT_TOKEN is required")
+		}
+		client := announcement.Client{Token: token, HTTP: &http.Client{Timeout: 12 * time.Second}}
+		result, sendErr := campaign.Run(ctx, *adminTest, client.Send)
+		if err := emit(result); err != nil {
+			return err
+		}
+		return sendErr
+	}
 	if command == "profile-backfill" {
 		flags := flag.NewFlagSet("profile-backfill", flag.ContinueOnError)
 		limit := flags.Int("limit", 20, "maximum existing Telegram users to inspect (1..100)")
