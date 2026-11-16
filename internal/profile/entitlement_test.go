@@ -45,7 +45,7 @@ func TestPlanQuotasAndSuccessfulConsumption(t *testing.T) {
 		id    int64
 		plan  entitlement.PlanID
 		limit int
-	}{{11, entitlement.Visitor, 1}, {12, entitlement.Standard, 5}, {13, entitlement.Premium, 30}} {
+	}{{11, entitlement.Visitor, 1}, {12, entitlement.Standard, 25}, {13, entitlement.Premium, 30}} {
 		if tc.plan == entitlement.Visitor {
 			if _, err = s.Ensure(tc.id); err != nil {
 				t.Fatal(err)
@@ -139,8 +139,8 @@ func TestConcurrentStandardReservationsCannotExceedAllowance(t *testing.T) {
 	defer s.DB.Close()
 	grantPlan(t, s, 41, entitlement.Standard, time.Now().Add(time.Hour))
 	var wg sync.WaitGroup
-	results := make(chan error, 20)
-	for i := 0; i < 20; i++ {
+	results := make(chan error, 32)
+	for i := 0; i < 32; i++ {
 		wg.Add(1)
 		go func() { defer wg.Done(); results <- s.Reserve(NewID(), 41, time.Now()) }()
 	}
@@ -258,7 +258,7 @@ func TestActivationRenewalIsIdempotentAndStandard(t *testing.T) {
 		t.Fatal("distinct payment did not renew")
 	}
 	a, _ := s.Access(61, now)
-	if a.Policy.ID != entitlement.Standard || a.Allowance != 5 {
+	if a.Policy.ID != entitlement.Standard || a.Allowance != 25 {
 		t.Fatalf("new paid policy=%+v", a)
 	}
 	expired, err := s.Access(61, renewed.Add(time.Second))

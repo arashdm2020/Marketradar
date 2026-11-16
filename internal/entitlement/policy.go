@@ -34,7 +34,7 @@ type Policy struct {
 // these policies and never compares plan names to grant individual features.
 var Defaults = map[PlanID]Policy{
 	Visitor:  {ID: Visitor, Label: "Visitor", DailyAllowance: 1, Priority: 0, AllMarkets: true},
-	Standard: {ID: Standard, Label: "Standard", DailyAllowance: 5, Priority: 1, AllMarkets: true},
+	Standard: {ID: Standard, Label: "Standard", DailyAllowance: 25, Priority: 1, AllMarkets: true},
 	Premium: {
 		ID: Premium, Label: "Premium", DailyAllowance: 30, Priority: 2, AllMarkets: true,
 		Features: Features{MultiTimeframeEligible: true, ExtendedReportEligible: true},

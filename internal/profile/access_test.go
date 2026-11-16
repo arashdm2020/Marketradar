@@ -160,14 +160,14 @@ func TestPaidTelegramSubscriptionUsesStandardQuota(t *testing.T) {
 	if e = s.ActivateOnce(77, "legacy-charge", "telegram_stars", now); e != nil {
 		t.Fatal(e)
 	}
-	for i := 0; i < 5; i++ {
+	for i := 0; i < 25; i++ {
 		id := fmt.Sprintf("paid-%d", i)
 		if e = s.Reserve(id, 77, now); e != nil {
 			t.Fatal(e)
 		}
 		_ = s.SetUse(id, "consumed")
 	}
-	if e = s.Reserve("sixth", 77, now); !errors.Is(e, ErrQuota) {
+	if e = s.Reserve("twenty-sixth", 77, now); !errors.Is(e, ErrQuota) {
 		t.Fatalf("standard quota not enforced: %v", e)
 	}
 }
