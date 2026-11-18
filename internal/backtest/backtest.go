@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"time"
+	"tradebot/internal/catalog"
 	"tradebot/internal/domain"
 	"tradebot/internal/risk"
 	"tradebot/internal/snapshot"
@@ -28,6 +29,7 @@ type Report struct {
 	BUY            int       `json:"buy"`
 	SELL           int       `json:"sell"`
 	WAIT           int       `json:"wait"`
+	Conditional    int       `json:"conditional"`
 	Invalid        int       `json:"invalid"`
 	Activated      int       `json:"activated"`
 	Wins           int       `json:"wins"`
@@ -41,7 +43,14 @@ type Report struct {
 
 func Evaluate(d domain.Decision, future []domain.Candle, horizon int, costR float64) Outcome {
 	o := Outcome{DecisionTime: d.Snapshot.AnalysisTimeUTC, Signal: d.Final, Status: "WAIT"}
-	if d.Final == "WAIT" {
+	if d.Final == "WAIT" || d.Final == "CONDITIONAL" {
+		if d.Final == "CONDITIONAL" {
+			o.Status = "CONDITIONAL_NOT_EVALUATED"
+		}
+		return o
+	}
+	if d.Final != "BUY" && d.Final != "SELL" {
+		o.Status = "ANALYSIS_UNAVAILABLE"
 		return o
 	}
 	if len(future) < horizon {
@@ -98,42 +107,66 @@ func Evaluate(d domain.Decision, future []domain.Candle, horizon int, costR floa
 	return o
 }
 func Run(ctx context.Context, all []domain.Candle, samples, horizon int, minRR, costR float64, a Analyst) (Report, error) {
+	return RunFor(ctx, all, "XAU/USD", "5min", samples, horizon, minRR, costR, a)
+}
+
+func RunFor(ctx context.Context, all []domain.Candle, symbol string, frame catalog.Timeframe, samples, horizon int, minRR, costR float64, a Analyst) (Report, error) {
 	r := Report{Limitations: []string{"Candle-only fills are simulated; SL wins same-candle TP/SL ambiguity; bid/ask unavailable."}}
-	if len(all) < 500+horizon+1 {
-		return r, fmt.Errorf("history needs at least %d candles", 500+horizon+1)
+	count, err := catalog.RequiredCandles(frame)
+	if err != nil {
+		return r, err
 	}
-	max := len(all) - 500 - horizon
+	if samples < 1 || horizon < 1 {
+		return r, fmt.Errorf("samples and horizon must be positive")
+	}
+	if len(all) < count+horizon {
+		return r, fmt.Errorf("history needs at least %d candles", count+horizon)
+	}
+	max := len(all) - count - horizon + 1
 	if samples > max {
 		samples = max
 	}
 	for n := 0; n < samples; n++ {
-		idx := 500 + n*max/samples
-		window := all[idx-500 : idx]
-		at := window[499].Time.Add(5*time.Minute + 30*time.Second)
-		s, e := snapshot.Build("XAU/USD", "M5", window, at, 5*time.Minute, 30*time.Second)
+		idx := count
+		if samples > 1 {
+			idx += n * (max - 1) / (samples - 1)
+		}
+		window := all[idx-count : idx]
+		at := window[count-1].Time.Add(frame.Duration() + 30*time.Second)
+		s, e := snapshot.Build(symbol, frame.Label(), window, at, frame.Duration(), 30*time.Second)
 		if e != nil {
 			return r, e
+		}
+		if !s.Quality.Fresh {
+			r.Invalid++
+			r.Outcomes = append(r.Outcomes, Outcome{DecisionTime: at, Signal: "ANALYSIS_UNAVAILABLE", Status: "MARKET_DATA_ERROR", Error: s.Quality.StaleReason})
+			continue
 		}
 		p, e := a.Analyze(ctx, s)
 		if e != nil {
 			r.Invalid++
-			r.Outcomes = append(r.Outcomes, Outcome{DecisionTime: at, Signal: "WAIT", Status: "AI_ERROR", Error: e.Error()})
+			r.Outcomes = append(r.Outcomes, Outcome{DecisionTime: at, Signal: "ANALYSIS_UNAVAILABLE", Status: "AI_ERROR", Error: e.Error()})
 			continue
 		}
 		d := risk.Validate(s, p, minRR)
+		if d.Final == "WAIT" && p.Signal != "WAIT" {
+			d.Final = "ANALYSIS_UNAVAILABLE"
+			r.Invalid++
+		}
 		o := Evaluate(d, all[idx:idx+horizon], horizon, costR)
 		r.Outcomes = append(r.Outcomes, o)
-		r.Evaluated++
+		if d.Final != "ANALYSIS_UNAVAILABLE" {
+			r.Evaluated++
+		}
 		switch d.Final {
 		case "BUY":
 			r.BUY++
 		case "SELL":
 			r.SELL++
+		case "ANALYSIS_UNAVAILABLE":
+			// Invalid model output is not a market WAIT decision.
 		default:
 			r.WAIT++
-			if p.Signal != "WAIT" {
-				r.Invalid++
-			}
 		}
 		if o.Activated {
 			r.Activated++

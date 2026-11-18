@@ -232,13 +232,7 @@ func (w *AsyncWorker) process(ctx context.Context, req AnalysisRequest) {
 	})
 	analysisDuration := time.Since(start)
 	engineCount := len(d.Snapshot.Candles)
-	modelCount := req.ModelCandles
-	if modelCount > engineCount {
-		modelCount = engineCount
-	}
-	if engineCount == 0 {
-		modelCount = 0
-	}
+	modelCount := engineCount
 	_, _ = w.store.DB.Exec(`UPDATE request_states SET engine_candles=?,model_candles=? WHERE id=?`, engineCount, modelCount, req.ID)
 	attemptStatus := "completed"
 	if e != nil || d.Final == "ANALYSIS_UNAVAILABLE" {
@@ -275,7 +269,7 @@ func (w *AsyncWorker) process(ctx context.Context, req AnalysisRequest) {
 	_, _ = w.store.DB.Exec(`UPDATE request_states SET model=?,prompt_version=? WHERE id=?`, d.Model, d.PromptVersion, req.ID)
 	_ = w.store.Record(req.UserID, req.Symbol, string(req.Timeframe), req.Style, string(raw))
 	_ = w.store.UpdateRequestState(req.ID, "completed", string(raw), "", &msgID)
-	// A valid BUY/SELL/WAIT is the successful product outcome and consumes one
+	// A valid BUY/SELL/CONDITIONAL/WAIT is a completed product outcome and consumes one
 	// allowance. Delivery failures must not cause a second model run or a second
 	// authoritative result for the same analysis UUID.
 	_ = w.store.SetUse(req.ID, "consumed")

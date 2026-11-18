@@ -115,6 +115,8 @@ func dirFa(sig string) string {
 		return customEmoji(EmojiBuy) + " خرید"
 	case "SELL":
 		return customEmoji(EmojiSell) + " فروش"
+	case "CONDITIONAL":
+		return customEmoji(EmojiIfCondition) + " ورود مشروط"
 	default:
 		return customEmoji(EmojiWait) + " صبر"
 	}
@@ -128,6 +130,8 @@ func statusFa(final string) string {
 		return "تأیید شد — معامله فروش مشروط"
 	case "WAIT":
 		return "صبر — شرایط معامله برقرار نشده است"
+	case "CONDITIONAL":
+		return "سناریوی معتبر؛ ورود پس از تحقق شرط مشخص‌شده"
 	case "ANALYSIS_UNAVAILABLE":
 		return "تحلیل در دسترس نیست"
 	default:
@@ -182,13 +186,17 @@ func Render(d domain.Decision, symbol, frame, style string, u profile.User) stri
 		return b.String()
 	}
 
-	if d.Final == "WAIT" && len(d.ValidatedConditional) > 0 {
+	if d.Final == "CONDITIONAL" && len(d.ValidatedConditional) > 0 {
 		b.WriteString("<b>" + customEmoji(EmojiWait) + " ورود هنوز تأیید نشده است.</b>\n" + customEmoji(EmojiIfCondition) + " <b>شرط نخست:</b> " + html.EscapeString(triggerText(d.ValidatedConditional[0], inst.Precision)) + "\n\n")
 	}
 	b.WriteString("<b>" + customEmoji(EmojiFinalDecision) + " تصمیم نهایی: </b>" + dirFa(d.Final) + "\n")
 	b.WriteString("📋 وضعیت: " + statusFa(d.Final) + "\n\n")
-	if d.Final == "WAIT" && len(d.Proposed.Reasoning) > 0 {
-		b.WriteString("<b>دلیل صبر:</b> " + html.EscapeString(strings.Join(d.Proposed.Reasoning, "؛ ")) + "\n\n")
+	if (d.Final == "WAIT" || d.Final == "CONDITIONAL") && len(d.Proposed.Reasoning) > 0 {
+		label := "دلیل صبر"
+		if d.Final == "CONDITIONAL" {
+			label = "دلیل ورود مشروط"
+		}
+		b.WriteString("<b>" + label + ":</b> " + html.EscapeString(strings.Join(d.Proposed.Reasoning, "؛ ")) + "\n\n")
 	}
 
 	// AI proposed immediate trade
@@ -197,6 +205,9 @@ func Render(d domain.Decision, symbol, frame, style string, u profile.User) stri
 		if p.Entry != nil && p.StopLoss != nil && p.TP1 != nil {
 			f := func(v float64) string { return fmt.Sprintf("%.*f", inst.Precision, v) }
 			b.WriteString("<b>" + customEmoji(EmojiEntryPoint) + " معامله فوری:</b>\n")
+			if p.EntryTrigger != "" {
+				b.WriteString("   " + customEmoji(EmojiIfCondition) + " <b>شرط ورود:</b> " + html.EscapeString(p.EntryTrigger) + "\n")
+			}
 			fmt.Fprintf(&b, "   %s <b>ورود:</b> %s\n", customEmoji(EmojiEntryPoint), f(*p.Entry))
 			fmt.Fprintf(&b, "   %s <b>حد ضرر:</b> %s\n", customEmoji(EmojiStopLoss), f(*p.StopLoss))
 			fmt.Fprintf(&b, "   %s <b>حد سود ۱:</b> %s\n", customEmoji(EmojiTakeProfit), f(*p.TP1))

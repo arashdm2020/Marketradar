@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"time"
 	"tradebot/internal/ai"
 	"tradebot/internal/catalog"
@@ -44,23 +45,21 @@ func (e Engine) Analyze(ctx context.Context, r Request) (domain.Decision, error)
 	if err := catalog.ValidateCombination(r.Timeframe, r.Style); err != nil {
 		return domain.Decision{}, err
 	}
-	count := r.EngineCandles
-	if count == 0 {
-		count = 500
-	}
-	if count < 250 || count > 1000 || r.ModelCandles > count || r.ModelCandles < 0 {
-		return domain.Decision{}, fmt.Errorf("invalid candle configuration")
-	}
-	candles, err := e.Market.Fetch(ctx, inst.Provider, string(r.Timeframe), count+2)
+	count, err := catalog.RequiredCandles(r.Timeframe)
 	if err != nil {
 		return domain.Decision{}, err
 	}
-	now := time.Now().UTC()
-	candles = marketdata.Closed(candles, now, r.Timeframe.Duration(), e.Buffer)
-	if len(candles) < count {
-		return domain.Decision{}, fmt.Errorf("insufficient closed candles: %d", len(candles))
+	if r.EngineCandles != 0 && r.EngineCandles != count || r.ModelCandles != 0 && r.ModelCandles != count {
+		slog.Info("candle_policy_override", "symbol", r.Symbol, "timeframe", r.Timeframe, "configured_engine_candles", r.EngineCandles, "configured_model_candles", r.ModelCandles, "effective_engine_candles", count, "effective_model_candles", count)
 	}
-	s, err := snapshot.Build(r.Symbol, r.Timeframe.Label(), candles[len(candles)-count:], now, r.Timeframe.Duration(), e.Buffer)
+	now := time.Now().UTC()
+	// Historical admin window settings remain versioned, but the current
+	// timeframe policy fixes both engine and model history to count bars.
+	candles, err := e.Market.FetchClosed(ctx, inst.Provider, string(r.Timeframe), count, now, e.Buffer)
+	if err != nil {
+		return domain.Decision{}, err
+	}
+	s, err := snapshot.Build(r.Symbol, r.Timeframe.Label(), candles, now, r.Timeframe.Duration(), e.Buffer)
 	if err != nil {
 		return domain.Decision{}, err
 	}
@@ -75,7 +74,7 @@ func (e Engine) Analyze(ctx context.Context, r Request) (domain.Decision, error)
 			return domain.Decision{Snapshot: s, Final: "ANALYSIS_UNAVAILABLE", Reasons: []string{"AI configuration unavailable"}, IndicativeOnly: true}, nil
 		}
 	}
-	model.ModelCandles = r.ModelCandles
+	model.ModelCandles = count
 	if r.ResponseTokenBudget > 0 {
 		model.MaxTokens = r.ResponseTokenBudget
 	}
@@ -114,8 +113,12 @@ func (e Engine) Analyze(ctx context.Context, r Request) (domain.Decision, error)
 		candidate.TP1 = &tp
 		candidate.TP2 = setup.TP2
 		candidate.SetupQuality = "MEDIUM"
+		candidate.EntryTrigger = setup.Trigger
+		candidate.TriggerKind = setup.TriggerKind
+		candidate.TriggerPrice = &setup.TriggerPrice
+		candidate.Invalidation = setup.Invalidation
 		candidate.ConditionalSetups = nil
-		if risk.Validate(s, candidate, e.MinRR).Final == setup.Direction {
+		if risk.ValidateConditional(s, candidate, e.MinRR).Final == setup.Direction {
 			d.ValidatedConditional = append(d.ValidatedConditional, setup)
 		}
 	}
@@ -124,6 +127,9 @@ func (e Engine) Analyze(ctx context.Context, r Request) (domain.Decision, error)
 	}
 	for i := range d.ValidatedConditional {
 		d.ValidatedConditional[i].Expiration = condition.Expiry(s.AnalysisTimeUTC, r.Timeframe, r.Style).Format(time.RFC3339)
+	}
+	if d.Final == "WAIT" && len(d.ValidatedConditional) > 0 {
+		d.Final = "CONDITIONAL"
 	}
 	d.Model = model.Model
 	d.PromptVersion = ai.PromptVersion

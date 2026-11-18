@@ -30,7 +30,6 @@ import (
 	"tradebot/internal/engine"
 	"tradebot/internal/marketdata"
 	"tradebot/internal/profile"
-	"tradebot/internal/risk"
 	"tradebot/internal/snapshot"
 	"tradebot/internal/telegram"
 	"tradebot/internal/treasury"
@@ -432,8 +431,7 @@ func run() error {
 	if command != "analyze" && command != "inspect" && command != "backtest" {
 		return fmt.Errorf("unknown command")
 	}
-	interval := 5 * time.Minute
-	if command == "analyze" && len(os.Args) > 2 {
+	if command == "analyze" {
 		fs := flag.NewFlagSet("analyze", flag.ContinueOnError)
 		symbol := fs.String("symbol", cfg.Symbol, "symbol")
 		frame := fs.String("timeframe", cfg.Timeframe, "native interval")
@@ -449,19 +447,20 @@ func run() error {
 		if e != nil {
 			return e
 		}
+		save("latest_analysis.json", d)
 		return emit(d)
 	}
-	buffer := time.Duration(cfg.Buffer) * time.Second
-	count := cfg.Count
-	if command == "backtest" {
-		count = 1000
-	}
-	candles, e := md.Fetch(ctx, cfg.Symbol, cfg.Timeframe, count+2)
+	frame, e := catalog.ParseFrame(cfg.Timeframe)
 	if e != nil {
 		return e
 	}
+	count, e := catalog.RequiredCandles(frame)
+	if e != nil {
+		return e
+	}
+	interval := frame.Duration()
+	buffer := time.Duration(cfg.Buffer) * time.Second
 	now := time.Now().UTC()
-	candles = marketdata.Closed(candles, now, interval, buffer)
 	if command == "backtest" {
 		fs := flag.NewFlagSet("backtest", flag.ContinueOnError)
 		samples := fs.Int("samples", 20, "maximum AI decisions")
@@ -473,37 +472,24 @@ func run() error {
 		if *samples < 1 || *samples > 100 || (*horizon != 6 && *horizon != 12) {
 			return fmt.Errorf("samples must be 1..100; horizon 6 or 12")
 		}
-		r, e := backtest.Run(ctx, candles, *samples, *horizon, cfg.MinRR, *cost, analyst{model})
+		candles, fetchErr := md.FetchClosed(ctx, cfg.Symbol, cfg.Timeframe, count+*samples+*horizon, now, buffer)
+		if fetchErr != nil {
+			return fetchErr
+		}
+		r, e := backtest.RunFor(ctx, candles, cfg.Symbol, frame, *samples, *horizon, cfg.MinRR, *cost, analyst{model})
 		if e != nil {
 			return e
 		}
 		save("backtest.json", r)
 		return emit(r)
 	}
-	if len(candles) < 500 {
-		return fmt.Errorf("provider returned %d closed candles; need 500", len(candles))
-	}
-	candles = candles[len(candles)-500:]
-	s, e := snapshot.Build(cfg.Symbol, "M5", candles, now, interval, buffer)
+	candles, e := md.FetchClosed(ctx, cfg.Symbol, cfg.Timeframe, count, now, buffer)
 	if e != nil {
 		return e
 	}
-	if command == "inspect" {
-		return emit(s)
-	}
-	if !s.Quality.Fresh {
-		return emit(map[string]any{"final": "ANALYSIS_UNAVAILABLE", "reasons": []string{"market data stale or gapped"}, "quality": s.Quality})
-	}
-	a, e := model.Analyze(ctx, s)
+	s, e := snapshot.Build(cfg.Symbol, frame.Label(), candles, now, interval, buffer)
 	if e != nil {
-		return emit(map[string]any{"final": "ANALYSIS_UNAVAILABLE", "reasons": []string{e.Error()}})
+		return e
 	}
-	d := risk.Validate(s, a.Signal, cfg.MinRR)
-	d.Model = cfg.Model
-	d.PromptVersion = ai.PromptVersion
-	d.LatencyMS = a.LatencyMS
-	d.PromptTokens = a.PromptTokens
-	d.CompletionTokens = a.CompletionTokens
-	save("latest_analysis.json", d)
-	return emit(d)
+	return emit(s)
 }

@@ -3,10 +3,19 @@ package risk
 import (
 	"math"
 	"time"
+	"tradebot/internal/condition"
 	"tradebot/internal/domain"
 )
 
 func Validate(s domain.Snapshot, p domain.Signal, minRR float64) domain.Decision {
+	return validate(s, p, minRR, true)
+}
+
+func ValidateConditional(s domain.Snapshot, p domain.Signal, minRR float64) domain.Decision {
+	return validate(s, p, minRR, false)
+}
+
+func validate(s domain.Snapshot, p domain.Signal, minRR float64, requireConfirmed bool) domain.Decision {
 	d := domain.Decision{Snapshot: s, Proposed: p, Final: "WAIT", IndicativeOnly: true}
 	bad := func(x string) { d.Reasons = append(d.Reasons, x) }
 	if !s.Quality.Fresh {
@@ -26,9 +35,30 @@ func Validate(s domain.Snapshot, p domain.Signal, minRR float64) domain.Decision
 	if p.SetupQuality != "HIGH" && p.SetupQuality != "MEDIUM" {
 		bad("setup quality insufficient")
 	}
+	if p.EntryTrigger == "" {
+		bad("entry trigger missing")
+	}
+	if p.Invalidation == "" {
+		bad("invalidation missing")
+	}
 	if p.Entry == nil || p.StopLoss == nil || p.TP1 == nil {
 		bad("missing trade prices")
 		return d
+	}
+	if p.TriggerPrice == nil || *p.TriggerPrice <= 0 || math.IsNaN(*p.TriggerPrice) || math.IsInf(*p.TriggerPrice, 0) {
+		bad("trigger price missing or invalid")
+	} else if p.TriggerKind != "CLOSE_ABOVE" && p.TriggerKind != "CLOSE_BELOW" && p.TriggerKind != "TOUCH" && p.TriggerKind != "PULLBACK_BUY" && p.TriggerKind != "PULLBACK_SELL" {
+		bad("trigger kind invalid")
+	} else if requireConfirmed {
+		if p.Signal == "BUY" && p.TriggerKind == "CLOSE_BELOW" || p.Signal == "SELL" && p.TriggerKind == "CLOSE_ABOVE" || p.Signal == "BUY" && p.TriggerKind == "PULLBACK_SELL" || p.Signal == "SELL" && p.TriggerKind == "PULLBACK_BUY" {
+			bad("trigger direction conflicts with signal")
+		}
+		if _, reached := condition.Step(p.TriggerKind, *p.TriggerPrice, *p.Entry, 0, s.Last); !reached {
+			bad("entry trigger not confirmed by last closed candle")
+		}
+		if *p.Entry < s.Last.Low || *p.Entry > s.Last.High {
+			bad("entry not reached by last closed candle")
+		}
 	}
 	for _, v := range []*float64{p.Entry, p.StopLoss, p.TP1, p.TP2} {
 		if v != nil && (*v <= 0 || math.IsNaN(*v) || math.IsInf(*v, 0)) {

@@ -58,6 +58,9 @@ type Signal struct {
 	MarketRegime      string             `json:"market_regime"`
 	Trend             string             `json:"trend"`
 	Signal            string             `json:"signal"`
+	EntryTrigger      string             `json:"entry_trigger,omitempty"`
+	TriggerKind       string             `json:"trigger_kind,omitempty"`
+	TriggerPrice      *float64           `json:"trigger_price,omitempty"`
 	Entry             *float64           `json:"entry"`
 	StopLoss          *float64           `json:"stop_loss"`
 	TP1               *float64           `json:"take_profit_1"`

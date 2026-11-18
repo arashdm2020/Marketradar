@@ -16,12 +16,14 @@ const (
 	HorizonPosition Horizon = "position"
 )
 
-var Frames = []Timeframe{"1min", "5min", "15min", "30min", "1h", "4h", "1day", "1week"}
+// Append new frames so historic index-based Telegram callbacks keep meaning.
+var Frames = []Timeframe{"1min", "5min", "15min", "30min", "1h", "4h", "1day", "1week", "3min"}
 
 // HorizonMatrix is product policy, not a universal trading rule. Keep every
 // UI and backend admission check based on this single authoritative matrix.
 var HorizonMatrix = map[Timeframe][]Horizon{
 	"1min":  {HorizonScalp},
+	"3min":  {HorizonScalp},
 	"5min":  {HorizonScalp, HorizonIntraday},
 	"15min": {HorizonScalp, HorizonIntraday},
 	"30min": {HorizonIntraday},
@@ -104,10 +106,23 @@ func ParseFrame(s string) (Timeframe, error) {
 	}
 	return "", fmt.Errorf("unsupported timeframe %q", s)
 }
+
+// RequiredCandles is the authoritative AI and replay history policy.
+func RequiredCandles(frame Timeframe) (int, error) {
+	if _, err := ParseFrame(string(frame)); err != nil {
+		return 0, err
+	}
+	if frame.Duration() <= 15*time.Minute {
+		return 200, nil
+	}
+	return 250, nil
+}
 func (f Timeframe) Label() string {
 	switch f {
 	case "1min":
 		return "M1"
+	case "3min":
+		return "M3"
 	case "5min":
 		return "M5"
 	case "15min":
@@ -129,6 +144,8 @@ func (f Timeframe) Duration() time.Duration {
 	switch f {
 	case "1min":
 		return time.Minute
+	case "3min":
+		return 3 * time.Minute
 	case "5min":
 		return 5 * time.Minute
 	case "15min":

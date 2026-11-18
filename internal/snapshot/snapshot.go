@@ -10,15 +10,12 @@ import (
 )
 
 func Build(symbol, timeframe string, c []domain.Candle, at time.Time, interval, buffer time.Duration) (domain.Snapshot, error) {
-	if len(c) < 250 || len(c) > 1000 {
-		return domain.Snapshot{}, fmt.Errorf("snapshot requires 250..1000 candles, got %d", len(c))
+	if len(c) < 200 || len(c) > 1000 {
+		return domain.Snapshot{}, fmt.Errorf("snapshot requires 200..1000 candles, got %d", len(c))
 	}
-	v, e := marketdata.Normalize(c)
+	v, e := marketdata.SelectClosed(c, at, interval, buffer, len(c))
 	if e != nil {
 		return domain.Snapshot{}, e
-	}
-	if !v[len(v)-1].Time.Add(interval).Add(buffer).Before(at) && !v[len(v)-1].Time.Add(interval).Add(buffer).Equal(at) {
-		return domain.Snapshot{}, fmt.Errorf("last candle incomplete")
 	}
 	q := marketdata.Check(v, at, interval, buffer)
 	last := v[len(v)-1]

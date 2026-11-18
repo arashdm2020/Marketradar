@@ -25,6 +25,26 @@ type response struct {
 }
 
 func (c Client) Fetch(ctx context.Context, symbol, interval string, count int) ([]domain.Candle, error) {
+	if count < 1 || count > 5000 {
+		return nil, fmt.Errorf("Twelve Data outputsize must be 1..5000")
+	}
+	if interval == "3min" {
+		if count*3+6 > 5000 {
+			return nil, fmt.Errorf("M3 history exceeds provider page limit")
+		}
+		minutes, err := c.Fetch(ctx, symbol, "1min", count*3+6)
+		if err != nil {
+			return nil, err
+		}
+		bars, err := Aggregate3Min(minutes)
+		if err != nil {
+			return nil, err
+		}
+		if len(bars) > count {
+			bars = bars[len(bars)-count:]
+		}
+		return bars, nil
+	}
 	if c.Key == "" {
 		return nil, fmt.Errorf("Twelve Data key missing")
 	}
@@ -54,7 +74,16 @@ func (c Client) Fetch(ctx context.Context, symbol, interval string, count int) (
 			return nil, e
 		}
 		resp, e := h.Do(req)
+		retryAfter := time.Duration(0)
 		if e == nil {
+			if resp.StatusCode == http.StatusTooManyRequests {
+				if seconds, parseErr := strconv.Atoi(resp.Header.Get("Retry-After")); parseErr == nil && seconds > 0 {
+					if seconds > 30 {
+						seconds = 30
+					}
+					retryAfter = time.Duration(seconds) * time.Second
+				}
+			}
 			body, e = io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 			resp.Body.Close()
 			if e == nil && resp.StatusCode == 200 {
@@ -68,6 +97,9 @@ func (c Client) Fetch(ctx context.Context, symbol, interval string, count int) (
 			return nil, fmt.Errorf("Twelve Data unavailable after retries")
 		}
 		delay := time.Duration(1<<attempt)*time.Second + time.Duration(rand.Intn(300))*time.Millisecond
+		if retryAfter > delay {
+			delay = retryAfter
+		}
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()

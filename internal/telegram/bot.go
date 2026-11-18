@@ -689,7 +689,7 @@ func selectionLabel(parts []string) string {
 	if v, ok := catalog.Find(name); ok {
 		name = strings.ReplaceAll(v.Name, " / ", "/")
 	}
-	frame := map[string]string{"1min": "۱ دقیقه", "5min": "۵ دقیقه", "15min": "۱۵ دقیقه", "30min": "۳۰ دقیقه", "1h": "۱ ساعت", "4h": "۴ ساعت", "1day": "روزانه", "1week": "هفتگی"}[parts[1]]
+	frame := map[string]string{"1min": "۱ دقیقه", "3min": "۳ دقیقه", "5min": "۵ دقیقه", "15min": "۱۵ دقیقه", "30min": "۳۰ دقیقه", "1h": "۱ ساعت", "4h": "۴ ساعت", "1day": "روزانه", "1week": "هفتگی"}[parts[1]]
 	style := map[string]string{"scalp": "اسکالپ", "day": "روزانه", "swing": "میان‌مدت", "position": "بلندمدت"}[parts[2]]
 	return name + " · " + frame + " · " + style
 }
